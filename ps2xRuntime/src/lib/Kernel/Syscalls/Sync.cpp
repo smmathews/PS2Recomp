@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "Sync.h"
+#include "ps2_fiber.h"
 
 namespace ps2_syscalls
 {
@@ -212,11 +213,21 @@ namespace ps2_syscalls
             g_semas.erase(it);
         }
 
+        // Collect all waiting threads, then wake each with token validation.
+        std::vector<std::pair<int,uint64_t>> waiters;
         {
-            std::lock_guard<std::mutex> lock(sema->m);
+            std::lock_guard<std::mutex> lk(sema->m);
             sema->deleted = true;
+            waiters.swap(sema->waitList);
         }
-        sema->cv.notify_all();
+        for (const auto& [tid, token] : waiters)
+        {
+            ps2sched::enqueue_external_wakeup_validated(tid, token);
+        }
+        if (!waiters.empty())
+        {
+            ps2sched::maybe_yield();
+        }
 
         setReturnS32(ctx, KE_OK);
     }
@@ -239,8 +250,10 @@ namespace ps2_syscalls
         int ret = KE_OK;
         int beforeCount = 0;
         int afterCount = 0;
+        int wokenTid = 0;
+        uint64_t wokenToken = 0;
         {
-            std::lock_guard<std::mutex> lock(sema->m);
+            std::unique_lock<std::mutex> lock(sema->m);
             beforeCount = sema->count;
             if (sema->count >= sema->maxCount)
             {
@@ -249,9 +262,21 @@ namespace ps2_syscalls
             else
             {
                 sema->count++;
-                sema->cv.notify_one();
+                // Pop one waiter and wake it.
+                if (!sema->waitList.empty())
+                {
+                    wokenTid   = sema->waitList.front().first;
+                    wokenToken = sema->waitList.front().second;
+                    sema->waitList.erase(sema->waitList.begin());
+                }
             }
             afterCount = sema->count;
+            lock.unlock();
+        }
+        if (wokenTid != 0)
+        {
+            ps2sched::enqueue_external_wakeup_validated(wokenTid, wokenToken);
+            ps2sched::maybe_yield();
         }
 
         static std::atomic<uint32_t> s_signalSemaLogs{0};
@@ -283,13 +308,28 @@ namespace ps2_syscalls
             return;
         }
 
-        auto info = ensureCurrentThreadInfo(ctx);
-        throwIfTerminated(info);
+        // Borrowed host workers (g_currentThreadId == -1) are not PS2 threads;
+        // they must never create or mutate a g_threads entry (all such workers
+        // would alias tid -1 and race each other). Only a real fiber gets a
+        // ThreadInfo. info == nullptr drives the non-fiber retry path below; all
+        // ThreadInfo accesses are already guarded by `if (info)`.
+        const bool onFiber = (ps2fiber_current() != nullptr);
+        std::shared_ptr<ThreadInfo> info =
+            onFiber ? ensureCurrentThreadInfo(ctx) : nullptr;
+        throwIfTerminated(info); // throwIfTerminated is null-safe
         std::unique_lock<std::mutex> lock(sema->m);
         int ret = 0;
 
-        if (sema->count == 0)
+        if (sema->count > 0)
         {
+            // Fast path: permit available immediately.
+            sema->count--;
+            // fallthrough to logging + return
+        }
+        else
+        {
+            // Slow path: wait until we can consume a permit (Mesa monitor semantics).
+            // Re-check count > 0 after each wake; re-block if stolen by PollSema.
             static std::atomic<uint32_t> s_waitSemaBlockLogs{0};
             const uint32_t blockLog = s_waitSemaBlockLogs.fetch_add(1, std::memory_order_relaxed);
             if (blockLog < 256u)
@@ -302,53 +342,122 @@ namespace ps2_syscalls
                                                     << std::endl);
             }
 
-            if (info)
+            NonFiberBackoff nfBackoff; // unused for fibers; ramps for borrowed workers
+            for (;;)
             {
-                std::lock_guard<std::mutex> tLock(info->m);
-                info->status = (info->suspendCount > 0) ? THS_WAITSUSPEND : THS_WAIT;
-                info->waitType = TSW_SEMA;
-                info->waitId = sid;
-                info->forceRelease = false;
-            }
-
-            sema->waiters++;
-            {
-                PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
-                sema->cv.wait(lock, [&]()
-                              {
-                                  bool forced = info ? info->forceRelease.load() : false;
-                                  bool terminated = info ? info->terminated.load() : false;
-                                  return sema->count > 0 || sema->deleted || forced || terminated; //
-                              });
-            }
-            sema->waiters--;
-            if (sema->deleted)
-            {
-                ret = KE_WAIT_DELETE;
-            }
-
-            if (info)
-            {
-                std::lock_guard<std::mutex> tLock(info->m);
-                info->status = (info->suspendCount > 0) ? THS_SUSPEND : THS_RUN;
-                info->waitType = TSW_NONE;
-                info->waitId = 0;
-                if (info->forceRelease)
+                // Set wait state on current thread (briefly lock info->m).
+                if (info)
                 {
+                    std::lock_guard<std::mutex> tLock(info->m);
+                    info->status = (info->suspendCount > 0) ? THS_WAITSUSPEND : THS_WAIT;
+                    info->waitType = TSW_SEMA;
+                    info->waitId = sid;
                     info->forceRelease = false;
-                    ret = KE_RELEASE_WAIT;
                 }
-            }
 
-            if (info && info->terminated.load())
-            {
-                throw ThreadExitException();
+                // Only a real fiber may publish itself to the object wait-list.
+                // A borrowed host worker (g_currentThreadId==-1) would alias every
+                // other borrowed worker as tid -1, so it skips publishing and relies
+                // on the block_current() non-fiber retry loop (which re-checks
+                // sema->count below).
+                if (onFiber)
+                {
+                    // Publish to the wait-list under sema->m so a SignalSema is
+                    // serialized against our enqueue. arm_park() runs AFTER we
+                    // drop sema->m, so g_sched_mutex is never nested under an
+                    // object mutex. A SignalSema that fires in the publish/arm
+                    // window sees g_running_fiber == this fiber and records
+                    // wake_pending (consumed by block_current).
+                    sema->waiters++;
+                    sema->waitList.emplace_back(g_currentThreadId, ps2sched::current_fiber_token());
+                }
+
+                // Drop sema->m BEFORE any scheduler operation.
+                lock.unlock();
+
+                if (onFiber)
+                {
+                    ps2sched::arm_park();
+                }
+
+                const ps2sched::BlockResult br = ps2sched::block_current();
+
+                // Non-fiber (borrowed host worker) path: bounded exponential backoff
+                // so a never-satisfied condition cannot busy-spin the CPU.
+                if (br == ps2sched::BlockResult::NonFiberOwner ||
+                    br == ps2sched::BlockResult::NonFiberNoTok)
+                {
+                    // Borrowed host worker: bounded exponential backoff so a
+                    // never-satisfied condition cannot busy-spin the CPU.
+                    nfBackoff.step(br);
+                }
+
+                // === Woke up here ===
+                lock.lock();
+
+                // A fiber published itself to the wait-list; remove it if still
+                // present (SignalSema/DeleteSema may have already popped it). A
+                // non-fiber never published, so there is nothing to remove.
+                if (onFiber)
+                {
+                    auto& wl = sema->waitList;
+                    auto it = std::find_if(wl.begin(), wl.end(),
+                        [](const std::pair<int,uint64_t>& e){ return e.first == g_currentThreadId; });
+                    if (it != wl.end()) wl.erase(it);
+                    sema->waiters--;
+                }
+
+                // Wake reasons that abort the wait without consuming a permit:
+                if (sema->deleted)
+                {
+                    ret = KE_WAIT_DELETE;
+                    break;
+                }
+
+                if (info)
+                {
+                    bool release = false;
+                    {
+                        std::lock_guard<std::mutex> tLock(info->m);
+                        if (info->forceRelease)
+                        {
+                            info->forceRelease = false;
+                            release = true;
+                        }
+                    }
+                    if (release)
+                    {
+                        ret = KE_RELEASE_WAIT;
+                        break;
+                    }
+                }
+
+                if (info && info->terminated.load())
+                {
+                    throw ThreadExitException();
+                }
+
+                // Mesa re-check: only consume if a permit is actually available.
+                // If PollSema stole the count between SignalSema's unlock and our
+                // re-lock, count == 0 and we loop to re-block.
+                if (sema->count > 0)
+                {
+                    sema->count--;
+                    ret = 0;
+                    break;
+                }
+                // Spurious wake or permit stolen — loop and block again.
             }
         }
 
-        if (ret == 0 && sema->count > 0)
+        // Reset thread status on all non-exception exit paths (fast path, slow path success,
+        // and error breaks). The throw-ThreadExitException path unwinds without reaching here.
+        if (info)
         {
-            sema->count--;
+            std::lock_guard<std::mutex> tLock(info->m);
+            info->status = (info->suspendCount > 0) ? THS_SUSPEND : THS_RUN;
+            info->waitType = TSW_NONE;
+            info->waitId = 0;
         }
 
         static std::atomic<uint32_t> s_waitSemaWakeLogs{0};
@@ -435,14 +544,20 @@ namespace ps2_syscalls
     void CreateEventFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         uint32_t paramAddr = getRegU32(ctx, 4); // $a0
-        const uint32_t *param = reinterpret_cast<const uint32_t *>(getConstMemPtr(rdram, paramAddr));
 
         auto info = std::make_shared<EventFlagInfo>();
-        if (param)
+        if (paramAddr != 0u)
         {
-            info->attr = param[0];
-            info->option = param[1];
-            info->initBits = param[2];
+            // Read attr / option / initBits with full RDRAM range checks (matching
+            // CreateSema), instead of dereferencing a raw guest pointer. A field
+            // whose word falls outside RDRAM stays at its default of 0.
+            uint32_t attr = 0u, option = 0u, initBits = 0u;
+            readGuestU32Safe(rdram, paramAddr + 0u, attr);
+            readGuestU32Safe(rdram, paramAddr + 4u, option);
+            readGuestU32Safe(rdram, paramAddr + 8u, initBits);
+            info->attr = attr;
+            info->option = option;
+            info->initBits = initBits;
             info->bits = info->initBits;
         }
 
@@ -477,11 +592,20 @@ namespace ps2_syscalls
             return;
         }
 
+        std::vector<std::pair<int,uint64_t>> evfWaiters;
         {
-            std::lock_guard<std::mutex> lock(info->m);
+            std::lock_guard<std::mutex> lk(info->m);
             info->deleted = true;
+            evfWaiters.swap(info->waitList);
         }
-        info->cv.notify_all();
+        for (const auto& [tid, token] : evfWaiters)
+        {
+            ps2sched::enqueue_external_wakeup_validated(tid, token);
+        }
+        if (!evfWaiters.empty())
+        {
+            ps2sched::maybe_yield();
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -503,10 +627,15 @@ namespace ps2_syscalls
         }
 
         uint32_t newBits = 0u;
+        std::vector<std::pair<int,uint64_t>> setEvfWaiters;
         {
-            std::lock_guard<std::mutex> lock(info->m);
+            std::unique_lock<std::mutex> lock(info->m);
             info->bits |= bits;
             newBits = info->bits;
+            // Collect all waiting threads (they'll re-evaluate the condition on wake).
+            // Don't clear waitList yet — each waiter removes itself on wake.
+            setEvfWaiters = info->waitList;
+            lock.unlock();
         }
 
         static std::atomic<uint32_t> s_setEventFlagLogs{0};
@@ -519,7 +648,14 @@ namespace ps2_syscalls
                                               << " newBits=0x" << newBits
                                               << std::dec << std::endl);
         }
-        info->cv.notify_all();
+        for (const auto& [tid, token] : setEvfWaiters)
+        {
+            ps2sched::enqueue_external_wakeup_validated(tid, token);
+        }
+        if (!setEvfWaiters.empty())
+        {
+            ps2sched::maybe_yield();
+        }
         setReturnS32(ctx, 0);
     }
 
@@ -543,7 +679,6 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(info->m);
             info->bits &= bits;
         }
-        info->cv.notify_all();
         setReturnS32(ctx, KE_OK);
     }
 
@@ -587,7 +722,9 @@ namespace ps2_syscalls
             return;
         }
 
-        auto tInfo = ensureCurrentThreadInfo(ctx);
+        const bool onFiber = (ps2fiber_current() != nullptr);
+        std::shared_ptr<ThreadInfo> tInfo =
+            onFiber ? ensureCurrentThreadInfo(ctx) : nullptr;
         throwIfTerminated(tInfo);
         int ret = KE_OK;
 
@@ -625,6 +762,7 @@ namespace ps2_syscalls
                                                          << std::endl);
             }
 
+            // Update thread wait state.
             if (tInfo)
             {
                 std::lock_guard<std::mutex> tLock(tInfo->m);
@@ -634,12 +772,39 @@ namespace ps2_syscalls
                 tInfo->forceRelease = false;
             }
 
-            info->waiters++;
+            // Publish under info->m; arm_park after unlock (no nested locks).
+            if (onFiber)
             {
-                PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
-                info->cv.wait(lock, satisfied);
+                info->waiters++;
+                info->waitList.emplace_back(g_currentThreadId, ps2sched::current_fiber_token());
             }
-            info->waiters--;
+
+            // UNLOCK before any scheduler operation.
+            lock.unlock();
+            if (onFiber)
+            {
+                ps2sched::arm_park();
+            }
+            const ps2sched::BlockResult br = ps2sched::block_current();
+
+            // Non-fiber path — one bounded yield (WaitEventFlag has no
+            // re-block loop, so unbounded spinning is not possible here).
+            if (br == ps2sched::BlockResult::NonFiberOwner ||
+                br == ps2sched::BlockResult::NonFiberNoTok)
+            {
+                nonFiberBlockBackoff(br);
+            }
+
+            lock.lock();
+
+            if (onFiber)
+            {
+                auto &wl = info->waitList;
+                auto it = std::find_if(wl.begin(), wl.end(),
+                    [](const std::pair<int,uint64_t>& e){ return e.first == g_currentThreadId; });
+                if (it != wl.end()) wl.erase(it);
+                info->waiters--;
+            }
 
             if (tInfo)
             {
@@ -821,6 +986,124 @@ namespace ps2_syscalls
     void iReferEventFlagStatus(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         ReferEventFlagStatus(rdram, ctx, runtime);
+    }
+
+    static void alarmWorkerMain()
+    {
+        g_currentThreadId = -1; // host worker, not a fiber
+        for (;;)
+        {
+            std::shared_ptr<AlarmInfo> readyAlarm;
+            {
+                std::unique_lock<std::mutex> lock(g_alarm_mutex);
+                while (!readyAlarm)
+                {
+                    if (g_alarm_stop_flag.load(std::memory_order_acquire))
+                        return; // stop requested -> exit, fire nothing more
+                    if (g_alarms.empty())
+                    {
+                        g_alarm_cv.wait(lock);
+                        continue;
+                    }
+
+                    auto nextIt = std::min_element(
+                        g_alarms.begin(), g_alarms.end(),
+                        [](const auto &a, const auto &b)
+                        { return a.second->dueAt < b.second->dueAt; });
+                    if (nextIt == g_alarms.end())
+                    {
+                        g_alarm_cv.wait(lock);
+                        continue;
+                    }
+
+                    const auto now = std::chrono::steady_clock::now();
+                    if (nextIt->second->dueAt > now)
+                    {
+                        g_alarm_cv.wait_until(lock, nextIt->second->dueAt);
+                        continue;
+                    }
+
+                    readyAlarm = nextIt->second;
+                    g_alarms.erase(nextIt);
+                }
+            }
+
+            // After dropping the lock, re-check stop before touching rdram.
+            // If stop was requested we must NOT invoke the callback (rdram /
+            // runtime may be torn down).
+            if (g_alarm_stop_flag.load(std::memory_order_acquire))
+                return;
+
+            if (!readyAlarm || !readyAlarm->runtime || !readyAlarm->rdram ||
+                !readyAlarm->handler)
+                continue;
+            if (!readyAlarm->runtime->hasFunction(readyAlarm->handler))
+                continue;
+
+            try
+            {
+                constexpr uint32_t kAlarmCallbackStackSize = 0x4000u;
+                thread_local PS2Runtime *s_alarmStackRuntime = nullptr;
+                thread_local uint32_t s_alarmStackTop = 0u;
+                if (s_alarmStackRuntime != readyAlarm->runtime || s_alarmStackTop == 0u)
+                {
+                    s_alarmStackRuntime = readyAlarm->runtime;
+                    s_alarmStackTop = readyAlarm->runtime->reserveAsyncCallbackStack(
+                        kAlarmCallbackStackSize, 16u);
+                }
+
+                R5900Context callbackCtx{};
+                setRegU32(&callbackCtx, 28, readyAlarm->gp);
+                setRegU32(&callbackCtx, 29,
+                          (s_alarmStackTop != 0u) ? s_alarmStackTop
+                                                  : (PS2_RAM_SIZE - 0x10u));
+                setRegU32(&callbackCtx, 31, 0);
+                setRegU32(&callbackCtx, 4, static_cast<uint32_t>(readyAlarm->id));
+                setRegU32(&callbackCtx, 5, static_cast<uint32_t>(readyAlarm->ticks));
+                setRegU32(&callbackCtx, 6, readyAlarm->commonArg);
+                setRegU32(&callbackCtx, 7, 0);
+                callbackCtx.pc = readyAlarm->handler;
+
+                PS2Runtime::RecompiledFunction func =
+                    readyAlarm->runtime->lookupFunction(readyAlarm->handler);
+                {
+                    AsyncGuestScope guestScope; // token released even if func throws
+                    func(readyAlarm->rdram, &callbackCtx, readyAlarm->runtime);
+                }
+            }
+            catch (const ThreadExitException &)
+            {
+            }
+            catch (const std::exception &e)
+            {
+                static int alarmExceptionLogs = 0;
+                if (alarmExceptionLogs < 8)
+                {
+                    std::cerr << "[SetAlarm] callback exception: " << e.what() << std::endl;
+                    ++alarmExceptionLogs;
+                }
+            }
+        }
+    }
+
+    void ensureAlarmWorkerRunning()
+    {
+        std::call_once(g_alarm_worker_once, []()
+        {
+            g_alarm_stop_flag.store(false, std::memory_order_release);
+            g_alarm_thread = std::thread(alarmWorkerMain); // joinable so stopAlarmWorker() can join it
+            g_alarm_worker_started.store(true, std::memory_order_release);
+        });
+    }
+
+    void stopAlarmWorker()
+    {
+        if (!g_alarm_worker_started.load(std::memory_order_acquire))
+            return; // never started
+        g_alarm_stop_flag.store(true, std::memory_order_release);
+        g_alarm_cv.notify_all();
+        if (g_alarm_thread.joinable())
+            g_alarm_thread.join(); // wait for the worker to fully exit
     }
 
     void SetAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

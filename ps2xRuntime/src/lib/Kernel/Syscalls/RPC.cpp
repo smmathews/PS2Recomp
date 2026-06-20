@@ -589,18 +589,25 @@ namespace ps2_syscalls
             }
 
             bool signaled = false;
+            int wokenTid = 0;
             {
                 std::lock_guard<std::mutex> lock(sema->m);
                 if (!sema->deleted && sema->count < sema->maxCount)
                 {
                     sema->count++;
                     signaled = true;
+                    if (!sema->waitList.empty())
+                    {
+                        wokenTid = sema->waitList.front();
+                        sema->waitList.erase(sema->waitList.begin());
+                    }
                 }
             }
 
-            if (signaled)
+            if (wokenTid != 0)
             {
-                sema->cv.notify_one();
+                // Called from the RPC worker (non-guest host thread).
+                ps2sched::enqueue_external_wakeup(wokenTid);
             }
             return signaled;
         }

@@ -144,7 +144,6 @@ namespace
     };
 
     thread_local DispatchHistory g_dispatchHistory;
-    thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
 
     void pushDispatchPc(uint32_t pc)
     {
@@ -386,40 +385,6 @@ namespace
     }
 }
 
-PS2Runtime::GuestExecutionScope::GuestExecutionScope(PS2Runtime *runtime) noexcept
-    : m_runtime(runtime)
-{
-    if (m_runtime)
-    {
-        m_runtime->enterGuestExecution();
-    }
-}
-
-PS2Runtime::GuestExecutionScope::~GuestExecutionScope()
-{
-    if (m_runtime)
-    {
-        m_runtime->leaveGuestExecution();
-    }
-}
-
-PS2Runtime::GuestExecutionReleaseScope::GuestExecutionReleaseScope(PS2Runtime *runtime) noexcept
-    : m_runtime(runtime)
-{
-    if (m_runtime)
-    {
-        m_depth = m_runtime->releaseGuestExecution();
-    }
-}
-
-PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
-{
-    if (m_runtime && m_depth != 0u)
-    {
-        m_runtime->reacquireGuestExecution(m_depth);
-    }
-}
-
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -562,7 +527,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
-        ps2_syscalls::detachAllGuestHostThreads();
+        // Fiber pool is cleaned up by scheduler_shutdown() in run().
 #if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
@@ -728,7 +693,6 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
 
     m_cpuContext.pc = header.entry;
-    m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
 
     uint32_t maxLoadedRdramEnd = kGuestHeapDefaultBase;
     uint32_t moduleBase = std::numeric_limits<uint32_t>::max();
@@ -1730,19 +1694,11 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             lastPc = pc;
         }
 
-        m_debugPc.store(pc, std::memory_order_relaxed);
-        m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), std::memory_order_relaxed);
-        m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
-        m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
-
         RecompiledFunction fn = lookupFunction(pc);
         const uint32_t dispatchedPc = pc;
         const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
 
-        {
-            GuestExecutionScope guestExecution(this);
-            fn(rdram, ctx, this);
-        }
+        fn(rdram, ctx, this);
 
         if (ctx->pc == 0u)
         {
@@ -1764,76 +1720,9 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
     }
 }
 
-void PS2Runtime::enterGuestExecution()
-{
-    m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-    m_guestExecutionMutex.lock();
-    m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
-    ++g_guestExecutionDepths[this];
-}
-
-void PS2Runtime::leaveGuestExecution()
-{
-    auto it = g_guestExecutionDepths.find(this);
-    if (it == g_guestExecutionDepths.end() || it->second == 0u)
-    {
-        return;
-    }
-
-    --it->second;
-    m_guestExecutionMutex.unlock();
-    if (it->second == 0u)
-    {
-        g_guestExecutionDepths.erase(it);
-    }
-}
-
-uint32_t PS2Runtime::releaseGuestExecution()
-{
-    auto it = g_guestExecutionDepths.find(this);
-    if (it == g_guestExecutionDepths.end() || it->second == 0u)
-    {
-        return 0u;
-    }
-
-    const uint32_t depth = it->second;
-    for (uint32_t i = 0; i < depth; ++i)
-    {
-        m_guestExecutionMutex.unlock();
-    }
-    g_guestExecutionDepths.erase(it);
-    return depth;
-}
-
-void PS2Runtime::reacquireGuestExecution(uint32_t depth)
-{
-    if (depth == 0u)
-    {
-        return;
-    }
-
-    uint32_t &heldDepth = g_guestExecutionDepths[this];
-    for (uint32_t i = 0; i < depth; ++i)
-    {
-        m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
-        m_guestExecutionMutex.lock();
-        m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
-        ++heldDepth;
-    }
-}
-
 bool PS2Runtime::shouldPreemptGuestExecution()
 {
-    thread_local uint32_t s_backEdgeYieldCounter = 0u;
-    const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
-    const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;
-    if (++s_backEdgeYieldCounter < yieldInterval)
-    {
-        return false;
-    }
-
-    s_backEdgeYieldCounter = 0u;
-    return true;
+    return ps2sched::yield_point();
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
@@ -1974,6 +1863,11 @@ void PS2Runtime::requestStop()
     ps2_syscalls::notifyRuntimeStop();
 }
 
+void PS2Runtime::requestStopFlagOnly()
+{
+    m_stopRequested.store(true, std::memory_order_relaxed);
+}
+
 bool PS2Runtime::isStopRequested() const
 {
     return m_stopRequested.load(std::memory_order_relaxed);
@@ -1983,6 +1877,10 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 {
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
+
+// Trampoline pointer used by the scheduler stop callback (non-capturing lambda).
+// Set in run() before scheduler_init(); cleared after scheduler_shutdown() returns.
+static PS2Runtime* g_stopRuntime = nullptr;
 
 void PS2Runtime::run()
 {
@@ -1996,10 +1894,6 @@ void PS2Runtime::run()
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();
     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
-    m_debugPc.store(m_cpuContext.pc, std::memory_order_relaxed);
-    m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)), std::memory_order_relaxed);
-    m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0)), std::memory_order_relaxed);
-    m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0)), std::memory_order_relaxed);
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
@@ -2008,34 +1902,24 @@ void PS2Runtime::run()
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
-    g_activeThreads.store(1, std::memory_order_relaxed);
-    std::atomic<bool> gameThreadFinished{false};
+    // Initialize the fiber/pool scheduler.
+    ps2sched::scheduler_init();
+    g_stopRuntime = this;
+    ps2sched::scheduler_set_stop_callback(+[]{ if (g_stopRuntime) g_stopRuntime->requestStopFlagOnly(); });
 
-    std::thread gameThread([&]()
-                           {
-        ThreadNaming::SetCurrentThreadName("GameThread");
-        try
-        {
-            dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
-            uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
-            RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
-                      << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
-        }
-        catch (const std::exception &e)
-        {
-            std::cerr << "Error during program execution: " << e.what() << std::endl;
-        }
-        catch (...)
-        {
-            std::cerr << "Error during program execution: unknown exception" << std::endl;
-        }
-        g_activeThreads.fetch_sub(1, std::memory_order_relaxed);
-        gameThreadFinished.store(true, std::memory_order_release); });
+    // Create the main guest fiber (tid=1).
+    uint8_t *rdram = m_memory.getRDRAM();
+    {
+        const uint32_t entry = m_cpuContext.pc;
+        const uint32_t sp    = static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[29], 0));
+        const uint32_t gp    = static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[28], 0));
+        ps2sched::create_fiber(1, 1, entry, sp, gp, 0u, this, rdram);
+    }
 
     ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
 
     uint64_t tick = 0;
-    while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
+    while (!isStopRequested())
     {
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
@@ -2046,18 +1930,10 @@ void PS2Runtime::run()
                 uint64_t curGs = m_memory.gsWriteCount();
                 uint64_t curVif = m_memory.vifWriteCount();
                 const GSRegisters &gs = m_memory.gs();
-                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
-                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
-                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
-                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
                 const int activeThreads = g_activeThreads.load(std::memory_order_relaxed);
 
                 std::cout << "[run:tick] tick=" << tick
-                          << " pc=0x" << std::hex << dbgPc
-                          << " ra=0x" << dbgRa
-                          << " sp=0x" << dbgSp
-                          << " gp=0x" << dbgGp
-                          << " dispfb1=0x" << gs.dispfb1
+                          << " dispfb1=0x" << std::hex << gs.dispfb1
                           << " display1=0x" << gs.display1
                           << std::dec
                           << " activeThreads=" << activeThreads
@@ -2100,63 +1976,11 @@ void PS2Runtime::run()
 
     requestStop();
 
-    const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!gameThreadFinished.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < joinDeadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (gameThread.joinable())
-    {
-        if (gameThreadFinished.load(std::memory_order_acquire))
-        {
-            gameThread.join();
-        }
-        else
-        {
-            std::cerr << "[run] game thread did not stop within timeout; detaching" << std::endl;
-            gameThread.detach();
-        }
-    }
-
-    const auto workerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-    while (g_activeThreads.load(std::memory_order_relaxed) > 0 &&
-           std::chrono::steady_clock::now() < workerDeadline)
-    {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-
-    if (g_activeThreads.load(std::memory_order_relaxed) > 0)
-    {
-        requestStop();
-        const auto finalWorkerDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
-        while (g_activeThreads.load(std::memory_order_relaxed) > 0 &&
-               std::chrono::steady_clock::now() < finalWorkerDeadline)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-
-    if (g_activeThreads.load(std::memory_order_relaxed) == 0)
-    {
-        ps2_syscalls::joinAllGuestHostThreads();
-    }
-    else
-    {
-        std::cerr << "[run] guest host threads did not stop within timeout; detaching remaining worker threads"
-                  << std::endl;
-        ps2_syscalls::detachAllGuestHostThreads();
-    }
+    // Signal all guest fibers to stop and join the pool threads.
+    ps2sched::scheduler_shutdown();
+    ps2sched::scheduler_set_stop_callback(nullptr);
+    g_stopRuntime = nullptr;
 
     UnloadTexture(frameTex);
     CloseWindow();
-
-    const int remainingThreads = g_activeThreads.load(std::memory_order_relaxed);
-    RUNTIME_LOG("[run] exiting loop, activeThreads=" << remainingThreads);
-    if (remainingThreads > 0)
-    {
-        std::cerr << "[run] warning: " << remainingThreads
-                  << " guest worker thread(s) still active during shutdown." << std::endl;
-    }
 }

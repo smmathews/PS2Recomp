@@ -32,4 +32,10 @@ namespace ps2_syscalls
     void iCancelAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void ReleaseAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void iReleaseAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+    // Alarm worker lifecycle. ensureAlarmWorkerRunning() lazily starts a
+    // joinable worker thread. stopAlarmWorker() requests stop, wakes it, and
+    // joins it. stopAlarmWorker() is called from notifyRuntimeStop().
+    void ensureAlarmWorkerRunning();
+    void stopAlarmWorker();
 }

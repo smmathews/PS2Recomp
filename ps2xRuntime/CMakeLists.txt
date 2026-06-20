@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(PS2Runtime VERSION 0.1.0 LANGUAGES CXX)
+project(PS2Runtime VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -174,6 +174,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_scheduler.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/ps2_vu1.cpp
     src/lib/games_database.cpp
@@ -185,6 +186,11 @@ file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
 
 target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
+)
+
+# Fiber backend (ucontext on POSIX, pthread+sem_t on Vita; #ifdef PLATFORM_VITA)
+target_sources(ps2_runtime PRIVATE
+    src/lib/ps2_fiber.cpp
 )
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
@@ -224,6 +230,12 @@ endif()
 target_include_directories(ps2_runtime PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+)
+
+# Private include dir so Kernel/Syscalls/*.cpp can reach ps2_scheduler_internal.h
+# and ps2_fiber.h without relative path hacks.
+target_include_directories(ps2_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/lib
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend)

@@ -2,6 +2,7 @@
 #include "Interrupt.h"
 #include "ps2_log.h"
 #include "Stubs/GS.h"
+#include "ps2_fiber.h"
 
 namespace ps2_syscalls
 {
@@ -16,9 +17,10 @@ namespace ps2_syscalls
         std::mutex g_irq_worker_mutex;
         std::condition_variable g_irq_worker_cv;
         std::mutex g_vsync_flag_mutex;
-        std::condition_variable g_vsync_cv;
+        std::vector<std::pair<int, uint64_t>> g_vsync_waitList;
         std::atomic<bool> g_irq_worker_stop{false};
         std::atomic<bool> g_irq_worker_running{false};
+        std::thread g_irq_worker_thread; // joinable worker handle so stopInterruptWorker() can join it
         uint32_t g_enabled_intc_mask = 0xFFFFFFFFu;
         uint32_t g_enabled_dmac_mask = 0xFFFFFFFFu;
         uint64_t g_vsync_tick_counter = 0u;
@@ -132,6 +134,7 @@ namespace ps2_syscalls
                       { return a.order < b.order; });
         }
 
+        AsyncGuestScope guestScope; // token released on any exit path
         for (const IrqHandlerInfo &info : handlers)
         {
             if (!runtime->hasFunction(info.handler))
@@ -233,6 +236,7 @@ namespace ps2_syscalls
                       { return a.order < b.order; });
         }
 
+        AsyncGuestScope guestScope; // token released on any exit path
         for (const IrqHandlerInfo &info : handlers)
         {
             if (!runtime->hasFunction(info.handler))
@@ -288,7 +292,19 @@ namespace ps2_syscalls
             tickValue = ++g_vsync_tick_counter;
         }
 
-        g_vsync_cv.notify_all();
+        // Wake all guest threads waiting for the next vsync tick.
+        // Called from the IRQ worker (a non-guest host thread). Use the identity-
+        // validated wakeup so a recycled tid cannot deliver this tick to the wrong
+        // fiber: each entry carries the parking fiber's generation token.
+        std::vector<std::pair<int, uint64_t>> vsyncWaiters;
+        {
+            std::lock_guard<std::mutex> lk(g_vsync_flag_mutex);
+            vsyncWaiters.swap(g_vsync_waitList);
+        }
+        for (const auto &[tid, token] : vsyncWaiters)
+        {
+            ps2sched::enqueue_external_wakeup_validated(tid, token);
+        }
 
         if (reg.flagAddr != 0u)
         {
@@ -358,11 +374,17 @@ namespace ps2_syscalls
             return;
         }
 
+        // Reap a previously-stopped worker thread before starting a new one.
+        if (g_irq_worker_thread.joinable())
+        {
+            g_irq_worker_thread.join();
+        }
+
         g_irq_worker_stop.store(false, std::memory_order_release);
         g_irq_worker_running.store(true, std::memory_order_release);
         try
         {
-            std::thread(interruptWorkerMain, rdram, runtime).detach();
+            g_irq_worker_thread = std::thread(interruptWorkerMain, rdram, runtime); // JOINABLE
         }
         catch (...)
         {
@@ -385,21 +407,111 @@ namespace ps2_syscalls
     {
         g_irq_worker_stop.store(true, std::memory_order_release);
         g_irq_worker_cv.notify_all();
-        std::unique_lock<std::mutex> lock(g_irq_worker_mutex);
-        g_irq_worker_cv.wait_for(lock, std::chrono::milliseconds(500), []()
-                                 { return !g_irq_worker_running.load(std::memory_order_acquire); });
-        g_vsync_cv.notify_all();
+
+        // Actually JOIN the worker rather than a 500ms give-up. The worker
+        // loop checks g_irq_worker_stop on its CV wait and in its while-condition,
+        // so it exits promptly. We must NOT hold g_irq_worker_mutex while joining
+        // (the worker takes that mutex on its CV wait — joining under it would deadlock).
+        std::thread workerToJoin;
+        {
+            std::lock_guard<std::mutex> lock(g_irq_worker_mutex);
+            if (g_irq_worker_thread.joinable())
+            {
+                workerToJoin = std::move(g_irq_worker_thread);
+            }
+        }
+        if (workerToJoin.joinable())
+        {
+            workerToJoin.join();
+        }
+
+        // Wake any guest threads waiting on vsync during shutdown.
+        std::vector<std::pair<int, uint64_t>> vsyncWaiters;
+        {
+            std::lock_guard<std::mutex> lk(g_vsync_flag_mutex);
+            vsyncWaiters.swap(g_vsync_waitList);
+        }
+        for (const auto &[tid, token] : vsyncWaiters)
+        {
+            ps2sched::enqueue_external_wakeup_validated(tid, token);
+        }
     }
 
     uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime)
     {
         ensureInterruptWorkerRunning(rdram, runtime);
-        std::unique_lock<std::mutex> lock(g_vsync_flag_mutex);
-        uint64_t current = g_vsync_tick_counter;
+
+        // Opaque identity of the fiber that is about to park. Non-fiber host
+        // workers get token 0 and never publish to the wait-list.
+        const uint64_t selfToken = ps2sched::current_fiber_token();
+        const bool onFiber = (selfToken != 0u);
+
+        if (onFiber)
         {
-            PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
-            g_vsync_cv.wait(lock, [current, runtime]()
-                            { return g_vsync_tick_counter > current || (runtime != nullptr && runtime->isStopRequested()); });
+            // Publish under g_vsync_flag_mutex; arm_park after the lock is
+            // released so g_sched_mutex is never nested under it.
+            {
+                std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
+                g_vsync_waitList.emplace_back(g_currentThreadId, selfToken);
+            }
+            ps2sched::arm_park();
+        }
+
+        // Block the current fiber; signalVSyncFlag calls the validated wakeup
+        // from the IRQ worker thread to wake us.
+        const ps2sched::BlockResult br = ps2sched::block_current();
+
+        // A borrowed host worker cannot park on the fiber scheduler. Drop the token
+        // (only if owned) so the IRQ worker / fibers run, then return the
+        // current tick. A fiber returning WokenInWindow means a tick arrived during
+        // the parking window — also fine to return the current tick.
+        if (br == ps2sched::BlockResult::NonFiberOwner ||
+            br == ps2sched::BlockResult::NonFiberNoTok)
+        {
+            nonFiberBlockBackoff(br);
+        }
+
+        // A fiber woken from a real park (Parked) may have been woken by
+        // scheduler_shutdown / TerminateThread rather than a vsync tick. If so,
+        // unwind instead of returning a tick value. Mirrors WaitSema's terminate
+        // check after wake. (Borrowed host workers have no ThreadInfo and never
+        // reach Parked, so this is fiber-only.)
+        if (onFiber && br == ps2sched::BlockResult::Parked)
+        {
+            std::shared_ptr<ThreadInfo> info = lookupThreadInfo(g_currentThreadId);
+            if (info && info->terminated.load())
+            {
+                // Drop our wait-list entry before unwinding so a recycled tid
+                // cannot inherit a stale token.
+                {
+                    std::lock_guard<std::mutex> clLock(g_vsync_flag_mutex);
+                    auto &wl = g_vsync_waitList;
+                    auto it = std::find_if(wl.begin(), wl.end(),
+                                           [selfToken](const std::pair<int, uint64_t> &e)
+                                           { return e.second == selfToken; });
+                    if (it != wl.end()) wl.erase(it);
+                }
+                throw ThreadExitException();
+            }
+        }
+
+        // If we were woken by something other than a vsync tick (shutdown,
+        // TerminateThread, or a wakeup during the parking window), signalVSyncFlag
+        // never drained us, so our entry is still queued. Remove it by fiber-token
+        // identity (NOT by tid, which can recycle). A real vsync wake already
+        // swapped us out, so this erase is a harmless no-op on that path. Non-fiber
+        // callers never published, so there is nothing to erase.
+        std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
+        if (onFiber)
+        {
+            auto &wl = g_vsync_waitList;
+            auto it = std::find_if(wl.begin(), wl.end(),
+                                   [selfToken](const std::pair<int, uint64_t> &e)
+                                   { return e.second == selfToken; });
+            if (it != wl.end())
+            {
+                wl.erase(it);
+            }
         }
         return g_vsync_tick_counter;
     }

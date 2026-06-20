@@ -1,13 +1,80 @@
-namespace
+// ThreadExitException is defined in ThreadExit.h (outside any anonymous namespace).
+// ps2_scheduler.cpp includes ThreadExit.h directly to avoid pulling in the
+// many static helper functions in this file.
+#include "ThreadExit.h"
+#include <chrono>
+#include <thread>
+
+// Bounded backoff for a borrowed host worker that hit a blocking syscall.
+// Translates a non-fiber BlockResult into the correct token handling, then
+// sleeps with exponential backoff (1us -> 1ms cap). After kMaxSpins iterations
+// it logs ONCE and keeps sleeping at the cap so a self-deadlocked interrupt
+// handler cannot busy-spin the CPU or starve the guest executor. State is held
+// in a per-call counter object so each blocking site ramps independently.
+struct NonFiberBackoff
 {
-    struct ThreadExitException final : public std::exception
+    int spins = 0;
+    std::chrono::microseconds delay{1};
+
+    // Returns true if this worker should re-check its wait condition and may
+    // loop again; the syscall's Mesa loop decides whether to actually re-check.
+    void step(ps2sched::BlockResult br)
     {
-        const char *what() const noexcept override
+        // Drop/reacquire the guest token only if we actually own it.
+        if (br == ps2sched::BlockResult::NonFiberOwner)
         {
-            return "PS2 Thread Exit";
+            ps2sched::async_guest_end();
+            std::this_thread::sleep_for(delay);
+            ps2sched::async_guest_begin();
         }
-    };
+        else // NonFiberNoTok (or, defensively, any non-Parked non-fiber result)
+        {
+            std::this_thread::sleep_for(delay);
+        }
+
+        constexpr int kMaxSpins = 50;
+        if (spins == kMaxSpins)
+        {
+            std::fprintf(stderr,
+                "[ps2sched] WARNING: borrowed host worker has blocked on a guest "
+                "condition for %d retries; capping backoff at 1ms (possible "
+                "interrupt-context deadlock)\n", kMaxSpins);
+        }
+        if (spins < kMaxSpins)
+        {
+            ++spins;
+            delay *= 2;
+            if (delay > std::chrono::microseconds(1000))
+                delay = std::chrono::microseconds(1000);
+        }
+    }
+};
+
+// One-shot: drop/reacquire token (if owned) and yield once. SleepThread for
+// a borrowed worker has no wait-list to re-check, so it does not loop.
+inline void nonFiberBlockBackoff(ps2sched::BlockResult br)
+{
+    if (br == ps2sched::BlockResult::NonFiberOwner)
+    {
+        ps2sched::async_guest_end();
+        std::this_thread::yield();
+        ps2sched::async_guest_begin();
+    }
+    else
+    {
+        std::this_thread::yield();
+    }
 }
+
+// RAII guard that ensures async_guest_begin/async_guest_end are always paired,
+// even on exception paths. Use this in IRQ/DMAC/alarm workers instead of bare calls.
+struct AsyncGuestScope
+{
+    AsyncGuestScope()  { ps2sched::async_guest_begin(); }
+    ~AsyncGuestScope() { ps2sched::async_guest_end();   }
+    AsyncGuestScope(const AsyncGuestScope&) = delete;
+    AsyncGuestScope& operator=(const AsyncGuestScope&) = delete;
+};
 
 static void throwIfTerminated(const std::shared_ptr<ThreadInfo> &info)
 {
@@ -17,26 +84,19 @@ static void throwIfTerminated(const std::shared_ptr<ThreadInfo> &info)
     }
 }
 
-static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runtime *runtime = nullptr)
+static void waitWhileSuspended(const std::shared_ptr<ThreadInfo> &info, PS2Runtime * /*runtime*/ = nullptr)
 {
-    if (!info)
-        return;
-
-    std::unique_lock<std::mutex> lock(info->m);
-    if (info->suspendCount > 0)
-    {
-        info->status = THS_SUSPEND;
-        info->waitType = TSW_NONE;
-        info->waitId = 0;
-        {
-            PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
-            info->cv.wait(lock, [&]()
-                          { return info->suspendCount == 0 || info->terminated.load(); });
-        }
-        if (info->terminated.load())
-        {
-            throw ThreadExitException();
-        }
+    if (!info) return;
+    while (info->suspendCount > 0 && !info->terminated.load()) {
+        // arm_park() before publishing to any wait-list so a concurrent
+        // resume_fiber that fires between publish and block_current sees
+        // wake_pending rather than missing the wakeup.
+        ps2sched::arm_park();
+        ps2sched::block_current();
+    }
+    if (info->terminated.load()) { throw ThreadExitException(); }
+    if (info->suspendCount == 0) {
+        std::lock_guard<std::mutex> lock(info->m);
         info->status = THS_RUN;
     }
 }
@@ -116,96 +176,6 @@ static std::chrono::microseconds alarmTicksToDuration(uint16_t ticks)
     return std::chrono::microseconds(clampedTicks * kAlarmTickUsec);
 }
 
-static void ensureAlarmWorkerRunning()
-{
-    std::call_once(g_alarm_worker_once, []()
-                   { std::thread([]()
-                                 {
-            for (;;)
-            {
-                std::shared_ptr<AlarmInfo> readyAlarm;
-                {
-                    std::unique_lock<std::mutex> lock(g_alarm_mutex);
-                    while (!readyAlarm)
-                    {
-                        if (g_alarms.empty())
-                        {
-                            g_alarm_cv.wait(lock);
-                            continue;
-                        }
-
-                        auto nextIt = std::min_element(g_alarms.begin(), g_alarms.end(),
-                                                       [](const auto &a, const auto &b)
-                                                       {
-                                                           return a.second->dueAt < b.second->dueAt;
-                                                       });
-                        if (nextIt == g_alarms.end())
-                        {
-                            g_alarm_cv.wait(lock);
-                            continue;
-                        }
-
-                        const auto now = std::chrono::steady_clock::now();
-                        if (nextIt->second->dueAt > now)
-                        {
-                            g_alarm_cv.wait_until(lock, nextIt->second->dueAt);
-                            continue;
-                        }
-
-                        readyAlarm = nextIt->second;
-                        g_alarms.erase(nextIt);
-                    }
-                }
-
-                if (!readyAlarm || !readyAlarm->runtime || !readyAlarm->rdram || !readyAlarm->handler)
-                {
-                    continue;
-                }
-                if (!readyAlarm->runtime->hasFunction(readyAlarm->handler))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    constexpr uint32_t kAlarmCallbackStackSize = 0x4000u;
-                    thread_local PS2Runtime *s_alarmStackRuntime = nullptr;
-                    thread_local uint32_t s_alarmStackTop = 0u;
-                    if (s_alarmStackRuntime != readyAlarm->runtime || s_alarmStackTop == 0u)
-                    {
-                        s_alarmStackRuntime = readyAlarm->runtime;
-                        s_alarmStackTop = readyAlarm->runtime->reserveAsyncCallbackStack(kAlarmCallbackStackSize, 16u);
-                    }
-
-                    R5900Context callbackCtx{};
-                    setRegU32(&callbackCtx, 28, readyAlarm->gp);
-                    setRegU32(&callbackCtx, 29,
-                              (s_alarmStackTop != 0u) ? s_alarmStackTop : (PS2_RAM_SIZE - 0x10u));
-                    setRegU32(&callbackCtx, 31, 0);
-                    setRegU32(&callbackCtx, 4, static_cast<uint32_t>(readyAlarm->id));
-                    setRegU32(&callbackCtx, 5, static_cast<uint32_t>(readyAlarm->ticks));
-                    setRegU32(&callbackCtx, 6, readyAlarm->commonArg);
-                    setRegU32(&callbackCtx, 7, 0);
-                    callbackCtx.pc = readyAlarm->handler;
-
-                    PS2Runtime::RecompiledFunction func = readyAlarm->runtime->lookupFunction(readyAlarm->handler);
-                    func(readyAlarm->rdram, &callbackCtx, readyAlarm->runtime);
-                }
-                catch (const ThreadExitException &)
-                {
-                }
-                catch (const std::exception &e)
-                {
-                    static int alarmExceptionLogs = 0;
-                    if (alarmExceptionLogs < 8)
-                    {
-                        std::cerr << "[SetAlarm] callback exception: " << e.what() << std::endl;
-                        ++alarmExceptionLogs;
-                    }
-                }
-            } })
-                         .detach(); });
-}
 
 static void rpcCopyToRdram(uint8_t *rdram, uint32_t dst, uint32_t src, size_t size)
 {
@@ -309,6 +279,11 @@ static const char *rpcInvokeExitReasonName(RpcInvokeExitReason reason)
     }
 }
 
+// rpcInvokeFunction runs on the CALLING FIBER (the guest thread that issued
+// the RPC syscall), not on a worker thread. Do NOT wrap calls to this in
+// AsyncGuestScope — the calling fiber already holds the guest execution slot.
+// If, in the future, RPC server dispatch is moved to a dedicated worker thread,
+// that worker must wrap its guest invocation in AsyncGuestScope.
 static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                               uint32_t funcAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t *outV0)
 {
@@ -371,10 +346,7 @@ static bool rpcInvokeFunction(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
         }
 
         PS2Runtime::RecompiledFunction func = runtime->lookupFunction(pc);
-        {
-            PS2Runtime::GuestExecutionScope guestExecution(runtime);
-            func(rdram, &tmp, runtime);
-        }
+        func(rdram, &tmp, runtime);
         ++steps;
     }
 

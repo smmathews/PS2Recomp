@@ -23,6 +23,7 @@
 #include <iomanip>
 
 #include "ps2_log.h"
+#include "ps2_scheduler.h"
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_gs_gpu.h"
@@ -453,33 +454,6 @@ public:
 
     using RecompiledFunction = void (*)(uint8_t *, R5900Context *, PS2Runtime *);
 
-    class GuestExecutionScope
-    {
-    public:
-        explicit GuestExecutionScope(PS2Runtime *runtime) noexcept;
-        ~GuestExecutionScope();
-
-        GuestExecutionScope(const GuestExecutionScope &) = delete;
-        GuestExecutionScope &operator=(const GuestExecutionScope &) = delete;
-
-    private:
-        PS2Runtime *m_runtime = nullptr;
-    };
-
-    class GuestExecutionReleaseScope
-    {
-    public:
-        explicit GuestExecutionReleaseScope(PS2Runtime *runtime) noexcept;
-        ~GuestExecutionReleaseScope();
-
-        GuestExecutionReleaseScope(const GuestExecutionReleaseScope &) = delete;
-        GuestExecutionReleaseScope &operator=(const GuestExecutionReleaseScope &) = delete;
-
-    private:
-        PS2Runtime *m_runtime = nullptr;
-        uint32_t m_depth = 0u;
-    };
-
     void registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
@@ -516,11 +490,8 @@ public:
     void dispatchLoop(uint8_t *rdram, R5900Context *ctx);
     bool shouldPreemptGuestExecution();
     void requestStop();
+    void requestStopFlagOnly();
     bool isStopRequested() const;
-    uint32_t guestExecutionWaiterCountForTesting() const
-    {
-        return m_guestExecutionWaiters.load(std::memory_order_acquire);
-    }
 
     uint8_t Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr);
     uint16_t Load16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr);
@@ -605,15 +576,8 @@ private:
     uint32_t allocateGuestBlockLocked(uint32_t size, uint32_t alignment);
     void freeGuestBlockLocked(uint32_t guestAddr);
     void coalesceGuestHeapLocked();
-    void enterGuestExecution();
-    void leaveGuestExecution();
-    uint32_t releaseGuestExecution();
-    void reacquireGuestExecution(uint32_t depth);
 
     void HandleIntegerOverflow(R5900Context *ctx);
-
-    friend class GuestExecutionScope;
-    friend class GuestExecutionReleaseScope;
 
 private:
     PS2Memory m_memory;
@@ -624,8 +588,6 @@ private:
     PSPadBackend m_padBackend;
     VU1Interpreter m_vu1;
     R5900Context m_cpuContext;
-    mutable std::recursive_mutex m_guestExecutionMutex;
-    mutable std::atomic<uint32_t> m_guestExecutionWaiters{0u};
     mutable std::mutex m_guestHeapMutex;
     mutable std::mutex m_asyncCallbackStackMutex;
     std::vector<GuestHeapBlock> m_guestHeapBlocks;
@@ -639,12 +601,6 @@ private:
 
     std::unordered_map<uint32_t, RecompiledFunction> m_functionTable;
     std::atomic<bool> m_stopRequested{false};
-
-    // TODO remove this later
-    std::atomic<uint32_t> m_debugPc{0};
-    std::atomic<uint32_t> m_debugRa{0};
-    std::atomic<uint32_t> m_debugSp{0};
-    std::atomic<uint32_t> m_debugGp{0};
 
     struct LoadedModule
     {

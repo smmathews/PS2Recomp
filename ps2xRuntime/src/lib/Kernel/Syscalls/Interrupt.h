@@ -1,6 +1,11 @@
 #pragma once
 
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include <condition_variable>
+#include <utility>
+#include <vector>
 #include "ps2_syscalls.h"
 
 namespace ps2_syscalls
@@ -17,9 +22,16 @@ namespace ps2_syscalls
         extern std::mutex g_irq_worker_mutex;
         extern std::condition_variable g_irq_worker_cv;
         extern std::mutex g_vsync_flag_mutex;
-        extern std::condition_variable g_vsync_cv;
+        // Each entry pairs the guest tid with the parking fiber's identity token
+        // (from ps2sched::current_fiber_token(), which encodes the fiber's
+        // generation). signalVSyncFlag delivers the wakeup only to the exact
+        // fiber that parked, so a recycled tid cannot receive a stale tick.
+        // Borrowed host workers (g_currentThreadId == -1, token == 0) never park
+        // here, so every stored entry has a non-zero token.
+        extern std::vector<std::pair<int, uint64_t>> g_vsync_waitList;
         extern std::atomic<bool> g_irq_worker_stop;
         extern std::atomic<bool> g_irq_worker_running;
+        extern std::thread g_irq_worker_thread; // joinable worker handle
         extern uint32_t g_enabled_intc_mask;
         extern uint32_t g_enabled_dmac_mask;
         extern uint64_t g_vsync_tick_counter;
