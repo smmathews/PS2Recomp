@@ -459,10 +459,64 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 5, 1u);
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
-            t.Equals(runtime.memory().gs().dispfb1 & 0x1FFull, 151ull,
+            t.Equals(runtime.memory().gs().dispfb2 & 0x1FFull, 151ull,
                      "sceGsSwapDBuffDc should program GS to the selected display page");
-            t.Equals((runtime.memory().gs().display1 >> 32) & 0x0FFFull, 639ull,
+            t.Equals((runtime.memory().gs().display2 >> 32) & 0x0FFFull, 639ull,
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
+        });
+
+        tc.Run("sceGsPutDispEnv programs read circuit 2 only and leaves circuit 1 untouched", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            runtime.memory().gs().dispfb1 = 0xDEADBEEFDEADBEEFull;
+            runtime.memory().gs().display1 = 0xCAFEF00DCAFEF00Dull;
+            runtime.memory().gs().dispfb2 = 0u;
+            runtime.memory().gs().display2 = 0u;
+            runtime.memory().gs().pmode = 0u;
+            runtime.memory().gs().smode2 = 0u;
+            runtime.memory().gs().bgcolor = 0u;
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x6000u;
+            constexpr uint32_t kPmodeOffset = 0u;
+            constexpr uint32_t kSmode2Offset = 8u;
+            constexpr uint32_t kDispFbOffset = 16u;
+            constexpr uint32_t kDisplayOffset = 24u;
+            constexpr uint32_t kBgColorOffset = 32u;
+
+            const uint64_t pmode = 0x8007ull;
+            const uint64_t smode2 = 0x1ull;
+            const uint64_t dispfb = 0x9070ull;
+            const uint64_t display = 0x1234000000005678ull;
+            const uint64_t bgcolor = 0x00445566ull;
+
+            std::memcpy(rdram.data() + kEnvAddr + kPmodeOffset, &pmode, sizeof(pmode));
+            std::memcpy(rdram.data() + kEnvAddr + kSmode2Offset, &smode2, sizeof(smode2));
+            std::memcpy(rdram.data() + kEnvAddr + kDispFbOffset, &dispfb, sizeof(dispfb));
+            std::memcpy(rdram.data() + kEnvAddr + kDisplayOffset, &display, sizeof(display));
+            std::memcpy(rdram.data() + kEnvAddr + kBgColorOffset, &bgcolor, sizeof(bgcolor));
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            ps2_stubs::sceGsPutDispEnv(rdram.data(), &ctx, &runtime);
+
+            t.Equals(runtime.memory().gs().pmode, pmode,
+                     "sceGsPutDispEnv should program PMODE from the env");
+            t.Equals(runtime.memory().gs().smode2, smode2,
+                     "sceGsPutDispEnv should program SMODE2 from the env");
+            t.Equals(runtime.memory().gs().dispfb2, dispfb,
+                     "sceGsPutDispEnv should program DISPFB2 from the env");
+            t.Equals(runtime.memory().gs().display2, display,
+                     "sceGsPutDispEnv should program DISPLAY2 from the env");
+            t.Equals(runtime.memory().gs().bgcolor, bgcolor,
+                     "sceGsPutDispEnv should program BGCOLOR from the env");
+
+            t.Equals(runtime.memory().gs().dispfb1, 0xDEADBEEFDEADBEEFull,
+                     "sceGsPutDispEnv must not clobber circuit-1 DISPFB1");
+            t.Equals(runtime.memory().gs().display1, 0xCAFEF00DCAFEF00Dull,
+                     "sceGsPutDispEnv must not clobber circuit-1 DISPLAY1");
         });
 
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)

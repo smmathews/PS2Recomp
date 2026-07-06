@@ -1875,8 +1875,11 @@ namespace
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
-        regs.dispfb1 = env.dispfb;
-        regs.display1 = env.display;
+        // Circuit 1 (DISPFB1/DISPLAY1) is NOT programmed here: sceGsPutDispEnv's
+        // env struct describes read circuit 2 only; the game drives circuit 1
+        // itself via GS privileged MMIO. Writing circuit 1 from the single-
+        // circuit env forces both read circuits onto the same surface and
+        // collapses any two-buffer blend (e.g. movie underlay + UI overlay).
         regs.dispfb2 = env.dispfb;
         regs.display2 = env.display;
         regs.bgcolor = env.bgcolor;
