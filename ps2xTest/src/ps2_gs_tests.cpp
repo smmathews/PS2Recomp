@@ -3370,6 +3370,158 @@ void register_ps2_gs_tests()
                      "T4HL and T4HH uploads to the same shared CT32 word must not clobber each other's nibble");
             t.IsTrue(memReadersMatch,
                      "GSMem::ReadP4HL/ReadP4HH should agree with the raw shared-word nibble extraction");
+
+            // --- T8H coverage: full-byte upload, round-trip via GSMem::ReadP8H, and the
+            // --- clobber interaction when a later T4HL nibble upload lands on the same word.
+
+            constexpr uint32_t kDbpT8H = 128u;
+            constexpr uint32_t kDbwT8H = 1u;
+
+            // Full 0..255 range so both nibbles of the uploaded byte vary independently.
+            auto byteT8H = [](uint32_t x, uint32_t y) -> uint8_t
+            {
+                return static_cast<uint8_t>((x * 11u + y * 13u + 7u) & 0xFFu);
+            };
+
+            std::vector<uint8_t> packedT8H(kRrw * kRrh, 0u);
+            for (uint32_t y = 0; y < kRrh; ++y)
+            {
+                for (uint32_t x = 0; x < kRrw; ++x)
+                {
+                    packedT8H[y * kRrw + x] = byteT8H(x, y);
+                }
+            }
+
+            constexpr uint64_t kUploadT8HBitblt =
+                (static_cast<uint64_t>(kDbpT8H) << 32) |
+                (static_cast<uint64_t>(kDbwT8H) << 48) |
+                (static_cast<uint64_t>(GS_PSM_T8H) << 56);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, kUploadT8HBitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, kRect);
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            std::vector<uint8_t> packetT8H;
+            appendU64(packetT8H, makeGifTag(static_cast<uint16_t>(packedT8H.size() / 16u), GIF_FMT_IMAGE, 0u, true));
+            appendU64(packetT8H, 0ull);
+            packetT8H.insert(packetT8H.end(), packedT8H.begin(), packedT8H.end());
+            gs.processGIFPacket(packetT8H.data(), static_cast<uint32_t>(packetT8H.size()));
+
+            bool t8hByteMatches = true;
+            bool t8hMemReaderMatches = true;
+            for (uint32_t y = 0; y < kRrh; ++y)
+            {
+                for (uint32_t x = 0; x < kRrw; ++x)
+                {
+                    const uint32_t off = GSPSMCT32::addrPSMCT32(kDbpT8H, kDbwT8H, x, y);
+                    uint32_t word = 0u;
+                    std::memcpy(&word, vram.data() + off, sizeof(word));
+
+                    const uint8_t expected = byteT8H(x, y);
+                    const uint8_t got = static_cast<uint8_t>((word >> 24) & 0xFFu);
+                    if (got != expected)
+                        t8hByteMatches = false;
+
+                    const uint32_t memByte = GSMem::ReadP8H(vram.data(), kDbpT8H, kDbwT8H, x, y);
+                    if (memByte != expected)
+                        t8hMemReaderMatches = false;
+                }
+            }
+            t.IsTrue(t8hByteMatches,
+                     "T8H upload must land the full byte in bits 24-31 of the shared CT32 word");
+            t.IsTrue(t8hMemReaderMatches,
+                     "GSMem::ReadP8H should agree with the raw shared-word byte extraction after a T8H upload");
+
+            // Clobber interaction: upload a T8H byte plane, then upload a T4HL nibble plane to
+            // the same shared word. WriteP4HL's nibble RMW should overwrite bits 24-27 with the
+            // new nibble while preserving bits 28-31 (the T8H byte's high nibble).
+            constexpr uint32_t kDbpMix = 192u;
+            constexpr uint32_t kDbwMix = 1u;
+
+            auto byteMix = [](uint32_t x, uint32_t y) -> uint8_t
+            {
+                return static_cast<uint8_t>((x * 7u + y * 5u + 3u) & 0xFFu);
+            };
+            auto nibbleN = [](uint32_t x, uint32_t y) -> uint8_t
+            {
+                return static_cast<uint8_t>((x * 3u + y + 1u) & 0xFu);
+            };
+
+            std::vector<uint8_t> packedMixT8H(kRrw * kRrh, 0u);
+            for (uint32_t y = 0; y < kRrh; ++y)
+            {
+                for (uint32_t x = 0; x < kRrw; ++x)
+                {
+                    packedMixT8H[y * kRrw + x] = byteMix(x, y);
+                }
+            }
+
+            constexpr uint64_t kUploadMixT8HBitblt =
+                (static_cast<uint64_t>(kDbpMix) << 32) |
+                (static_cast<uint64_t>(kDbwMix) << 48) |
+                (static_cast<uint64_t>(GS_PSM_T8H) << 56);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, kUploadMixT8HBitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, kRect);
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            std::vector<uint8_t> packetMixT8H;
+            appendU64(packetMixT8H,
+                      makeGifTag(static_cast<uint16_t>(packedMixT8H.size() / 16u), GIF_FMT_IMAGE, 0u, true));
+            appendU64(packetMixT8H, 0ull);
+            packetMixT8H.insert(packetMixT8H.end(), packedMixT8H.begin(), packedMixT8H.end());
+            gs.processGIFPacket(packetMixT8H.data(), static_cast<uint32_t>(packetMixT8H.size()));
+
+            std::vector<uint8_t> packedMixNibble((kRrw * kRrh) / 2u, 0u);
+            for (uint32_t y = 0; y < kRrh; ++y)
+            {
+                for (uint32_t x = 0; x < kRrw; x += 2u)
+                {
+                    const uint8_t lo = nibbleN(x, y) & 0xFu;
+                    const uint8_t hi = nibbleN(x + 1u, y) & 0xFu;
+                    packedMixNibble[(y * kRrw + x) / 2u] = static_cast<uint8_t>(lo | (hi << 4));
+                }
+            }
+
+            constexpr uint64_t kUploadMixHLBitblt =
+                (static_cast<uint64_t>(kDbpMix) << 32) |
+                (static_cast<uint64_t>(kDbwMix) << 48) |
+                (static_cast<uint64_t>(GS_PSM_T4HL) << 56);
+
+            gs.writeRegister(GS_REG_BITBLTBUF, kUploadMixHLBitblt);
+            gs.writeRegister(GS_REG_TRXPOS, 0ull);
+            gs.writeRegister(GS_REG_TRXREG, kRect);
+            gs.writeRegister(GS_REG_TRXDIR, 0ull);
+
+            std::vector<uint8_t> packetMixNibble;
+            appendU64(packetMixNibble,
+                      makeGifTag(static_cast<uint16_t>(packedMixNibble.size() / 16u), GIF_FMT_IMAGE, 0u, true));
+            appendU64(packetMixNibble, 0ull);
+            packetMixNibble.insert(packetMixNibble.end(), packedMixNibble.begin(), packedMixNibble.end());
+            gs.processGIFPacket(packetMixNibble.data(), static_cast<uint32_t>(packetMixNibble.size()));
+
+            bool mixClobberMatches = true;
+            for (uint32_t y = 0; y < kRrh; ++y)
+            {
+                for (uint32_t x = 0; x < kRrw; ++x)
+                {
+                    const uint32_t off = GSPSMCT32::addrPSMCT32(kDbpMix, kDbwMix, x, y);
+                    uint32_t word = 0u;
+                    std::memcpy(&word, vram.data() + off, sizeof(word));
+
+                    const uint8_t gotLow = static_cast<uint8_t>((word >> 24) & 0xFu);
+                    const uint8_t gotHigh = static_cast<uint8_t>((word >> 28) & 0xFu);
+                    const uint8_t expectedLow = nibbleN(x, y);
+                    const uint8_t expectedHigh = static_cast<uint8_t>((byteMix(x, y) >> 4) & 0xFu);
+                    if (gotLow != expectedLow || gotHigh != expectedHigh)
+                        mixClobberMatches = false;
+                }
+            }
+            t.IsTrue(mixClobberMatches,
+                     "T4HL nibble upload over a T8H byte must overwrite bits 24-27 with the nibble and preserve "
+                     "bits 28-31 from the T8H byte's high nibble");
         });
 
         tc.Run("GS T4HL/T4HH sampling reads only its own plane through independent CLUTs", [](TestCase &t)
