@@ -266,6 +266,12 @@ struct PS2SoundDriverCompatLayout
     std::array<uint32_t, 2> clearBusyCallbacks{};
 
     // Service ids (0 = unused). A driver that muxes everything on one SID sets both equal.
+    // KNOWN LIMITATION: 0 is the "unused" sentinel, so a real service whose SID is
+    // literally 0 (or a subcommand whose fno is literally 0) cannot be expressed. This
+    // is a deliberate tradeoff and adequate in practice (real SIF-RPC services are nonzero); the
+    // deleted placeholder constants that were 0 (IOP_SID_SNDDRV_COMMAND / _SUBMIT) were
+    // never live services. If a title ever needs SID 0 / fno 0, add explicit has-value
+    // flags rather than overloading the 0 sentinel.
     uint32_t commandSid = 0;   // service id carrying the submit-command-buffer subcommand
     uint32_t stateSid   = 0;   // service id carrying the status/addr-table queries
 

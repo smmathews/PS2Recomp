@@ -920,13 +920,21 @@ void register_ps2_sif_rpc_tests()
                 (void)now;
             }
 
-            // unknown fno
+            // unknown fno.
+            // NOTE: this drives the handler directly and asserts its handler-local
+            // recv[0] write. In the real SifCallRpc path the benign status is NOT
+            // guest-visible: because the handler returns false (unhandled), the outer
+            // recv finalization (RPC.cpp: "if (!handled)" copy-from-send / zero branch)
+            // always overwrites recv[0] before the guest sees it. The assertion here
+            // therefore locks the handler's documented contract (spec: unknown fno on a
+            // served SID returns the benign discard status 0xffffff9b and falls through),
+            // not guest-observable state.
             {
                 std::memset(rdram + kRecv, 0, 16u);
                 const auto [r, rp, now] = call(0xABCDu, 0u, 0u, kRecv, 16u);
                 t.IsTrue(!r, "unknown fno on a served SID should not be treated as handled");
                 t.Equals(readGuestStruct<uint32_t>(rdram, kRecv), 0xffffff9bu,
-                         "unknown fno should write the benign status value to recv");
+                         "unknown fno should write the benign status value to recv (handler-local; overwritten by the outer recv finalization in the real SifCallRpc path)");
                 (void)rp;
                 (void)now;
             }

@@ -267,6 +267,18 @@ namespace
         layout.busyFlagAddr = 0x01E212C8u;
         layout.completionCallbacks = {0x002EAC20u, 0x002EAC30u, 0x002FAC20u, 0x002FAC30u};
         layout.clearBusyCallbacks = {0x002EAC30u, 0x002FAC30u};
+
+        // Service SID + subcommand (fno) numbers RE:CVX's sound driver speaks.
+        // On upstream main these were the hardcoded placeholder constants
+        // IOP_SID_SNDDRV_STATE / IOP_RPC_SNDDRV_GET_STATUS_ADDR / _GET_ADDR_TABLE;
+        // they must now be carried per-game so the getStatus RPC provisions the
+        // status/addr-table pool (which the sceSifGetOtherData checksum backfill
+        // depends on). The old submit path used placeholder SID 0 / fno 0 (a
+        // non-real service that never matched a live call) and is intentionally
+        // left unconfigured — the 0-sentinel design cannot express SID 0 / fno 0.
+        layout.stateSid = 1u;
+        layout.getStatusFno = 0x12u;
+        layout.getAddrTableFno = 0x13u;
         ps2_syscalls::setSoundDriverCompatLayout(layout);
     }
 
