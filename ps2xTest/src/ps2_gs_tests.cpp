@@ -509,6 +509,55 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc must not clobber circuit-1 DISPLAY1");
         });
 
+        tc.Run("sceGsSwapDBuff drives read circuit 2 only and preserves circuit 1", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            // Seed distinct circuit-1 sentinels AFTER initialize(); reset
+            // defaults are fbw=10 / 639x447, so these differ from them.
+            runtime.memory().gs().dispfb1 = 0xDEADBEEFDEADBEEFull;
+            runtime.memory().gs().display1 = 0xCAFEF00DCAFEF00Dull;
+            runtime.memory().gs().pmode = 0u;
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x8000u;
+            constexpr uint32_t kDBuffSize = 0x330u;
+            constexpr uint32_t kStackAddr = 0xB00u;
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 0u);   // psm
+            setRegU32(ctx, 6, 640u); // width
+            setRegU32(ctx, 7, 448u); // height
+            // sceGsSetDefDBuff (non-Dc) reads its trailing ztest/zpsm/clear
+            // args from the guest stack via sp+16/sp+20/sp+24, so sp (r29)
+            // must point at valid, zero-initialized rdram.
+            setRegU32(ctx, 29, kStackAddr);
+            std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
+            ps2_stubs::sceGsSetDefDBuff(rdram.data(), &ctx, &runtime);
+
+            std::memset(&ctx, 0, sizeof(ctx));
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 1u); // swap to page 1
+            ps2_stubs::sceGsSwapDBuff(rdram.data(), &ctx, &runtime);
+
+            // The double-buffer path programs read circuit 2 only. Its seeded
+            // PMODE must NOT enable read circuit 1 (EN1); otherwise the
+            // compositor blends the never-programmed circuit-1 surface (frozen
+            // at reset defaults) over the correct circuit-2 page.
+            t.Equals(runtime.memory().gs().pmode & 0x1ull, 0x0ull,
+                     "sceGsSwapDBuff must not enable read circuit 1 (EN1) in PMODE");
+            t.Equals(runtime.memory().gs().pmode & 0x2ull, 0x2ull,
+                     "sceGsSwapDBuff should enable read circuit 2 (EN2) in PMODE");
+
+            // The shared circuit-2-only helper must leave circuit 1 untouched.
+            t.Equals(runtime.memory().gs().dispfb1, 0xDEADBEEFDEADBEEFull,
+                     "sceGsSwapDBuff must not clobber circuit-1 DISPFB1");
+            t.Equals(runtime.memory().gs().display1, 0xCAFEF00DCAFEF00Dull,
+                     "sceGsSwapDBuff must not clobber circuit-1 DISPLAY1");
+        });
+
         tc.Run("sceGsPutDispEnv programs read circuit 2 only and leaves circuit 1 untouched", [](TestCase &t)
         {
             PS2Runtime runtime;
