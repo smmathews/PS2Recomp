@@ -1050,7 +1050,12 @@ namespace ps2_stubs
         }
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+        // Double-buffering drives read circuit 2 only: on swap, applyGsDispEnv
+        // programs DISPFB2/DISPLAY2 and never touches circuit 1. Enabling EN1
+        // here would advertise a circuit this path never programs, leaving the
+        // compositor to blend circuit 1's stale reset-default surface over the
+        // correct circuit-2 page. Seed EN2 only; circuit 1 stays guest-owned.
+        const uint64_t pmode = makePmode(0u, 1u, 0u, 0u, 0u, 0x80u);
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
@@ -1121,7 +1126,12 @@ namespace ps2_stubs
         }
 
         const uint32_t fbw = std::max<uint32_t>(1u, (w + 63u) / 64u);
-        const uint64_t pmode = makePmode(1u, 1u, 0u, 0u, 0u, 0x80u);
+        // Double-buffering drives read circuit 2 only: on swap, applyGsDispEnv
+        // programs DISPFB2/DISPLAY2 and never touches circuit 1. Enabling EN1
+        // here would advertise a circuit this path never programs, leaving the
+        // compositor to blend circuit 1's stale reset-default surface over the
+        // correct circuit-2 page. Seed EN2 only; circuit 1 stays guest-owned.
+        const uint64_t pmode = makePmode(0u, 1u, 0u, 0u, 0u, 0x80u);
         const uint64_t smode2 =
             (static_cast<uint64_t>(g_gparam.interlace & 0x1u) << 0) |
             (static_cast<uint64_t>(g_gparam.ffmode & 0x1u) << 1);
