@@ -1,6 +1,8 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include "ps2_syscalls.h"
 
 namespace ps2_syscalls
@@ -24,9 +26,18 @@ namespace ps2_syscalls
         extern uint32_t g_enabled_dmac_mask;
         extern uint64_t g_vsync_tick_counter;
         extern VSyncFlagRegistration g_vsync_registration;
+        extern std::atomic<uint32_t> g_pending_intc_causes;
+        constexpr uint32_t kPendingIntcMaxAgeTicks = 120u;
     }
 
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
+    void raisePendingIntc(uint32_t cause);
+    void drainPendingIntc(uint8_t *rdram, PS2Runtime *runtime);
+    // Test-support: restore all INTC/DMAC handler bookkeeping to process-start
+    // defaults so regression tests are order-independent. Must live in
+    // Interrupt.cpp: the handler tables are static per-TU and the pending-age
+    // array is not header-exposed, so only that TU can reset the live state.
+    void resetInterruptHandlerState();
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     void stopInterruptWorker();

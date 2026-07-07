@@ -1,6 +1,11 @@
 #include <algorithm>
 #include <cctype>
 
+namespace ps2_syscalls
+{
+    void raisePendingIntc(uint32_t cause);
+}
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -1434,6 +1439,43 @@ namespace
         for (const uint32_t completedCause : completedCauses)
         {
             ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
+        }
+
+        // VIF1 (channel 0x10009000) completes with INTC cause 5, and sce libdma
+        // registers that cause-5 handler AFTER the kick returns, so delivery must
+        // be deferred (drained next tick), not synchronous here.
+        //
+        // This raises cause 5 unconditionally on every VIF1 kick, not only when an
+        // interrupt was actually requested. That is a deliberate over-approximation.
+        // Honest fidelity gap: when a cause-5 handler is registered, this
+        // unconditional raise delivers on every VIF1 kick regardless of whether real
+        // hardware would have raised the interrupt.
+        //
+        // Why not gate it? The runtime DOES decode both relevant interrupt sources,
+        // but neither is usable as a clean per-kick gate at this call site:
+        //   - The VIFcode "i" bit IS decoded, into vif*_regs.stat bit 11 (INT), at
+        //     ps2_vif1_interpreter.cpp:311-312 (VIF1) and :79-80 (VIF0). But that
+        //     flag is STICKY -- cleared only by FBRST (RST memset at
+        //     ps2_memory.cpp:1018, or STC at :1024) or a CPU write -- and currently
+        //     inert: nothing in this runtime consumes the INT bit (the only stat
+        //     reads, ps2_vif1_interpreter.cpp:380/398, test bit 7 / DBF; the guest
+        //     MMIO read path does not expose vif1_regs.stat). With no per-kick clear
+        //     point and no consumer, it is not a clean edge signal; gating on it
+        //     would need new snapshot-and-clear semantics, and getting that wrong
+        //     reintroduces the very interrupt-drop this raise exists to avoid.
+        //   - The per-tag DMAtag IRQ bit IS decoded, at ps2_memory.cpp:1216, but in
+        //     the register-path DMA chain walker; this sce-libdma stub kick path
+        //     parses only the HEAD tag (for logging).
+        // Over-raising is chosen because it is benign when unused: the pending latch
+        // is level-triggered, so an unconsumed cause 5 ages out in
+        // kPendingIntcMaxAgeTicks (~2 s) drain ticks with no side effect, while DQ8's
+        // per-frame VIF1 display-list path consumes cause 5 every frame. A mis-gated
+        // raise, by contrast, would silently DROP legitimate interrupts. If the
+        // runtime ever makes the INT stat bit a clean per-kick edge (clear-on-read or
+        // a consumer with defined clear semantics), gate here instead.
+        if (channelBase == 0x10009000u) // VIF1
+        {
+            ps2_syscalls::raisePendingIntc(5u);
         }
 
         return 0;
