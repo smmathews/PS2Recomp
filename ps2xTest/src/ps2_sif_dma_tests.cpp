@@ -898,6 +898,8 @@ void register_ps2_sif_dma_tests()
             PS2SoundDriverCompatLayout compat{};
             compat.primarySeCheckAddr = kPrimarySeCheckAddr;
             compat.primaryMidiCheckAddr = kPrimaryMidiCheckAddr;
+            compat.stateSid = 1u;
+            compat.getStatusFno = 0x12u;
             ps2_syscalls::setSoundDriverCompatLayout(compat);
 
             constexpr uint32_t kClientAddr = 0x00023500u;
@@ -964,6 +966,8 @@ void register_ps2_sif_dma_tests()
             PS2SoundDriverCompatLayout compat{};
             compat.primarySeCheckAddr = kPrimarySeCheckAddr;
             compat.primaryMidiCheckAddr = kPrimaryMidiCheckAddr;
+            compat.stateSid = 1u;
+            compat.getStatusFno = 0x12u;
             ps2_syscalls::setSoundDriverCompatLayout(compat);
 
             constexpr uint32_t kClientAddr = 0x00023900u;
