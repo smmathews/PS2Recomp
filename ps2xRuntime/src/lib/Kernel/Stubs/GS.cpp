@@ -508,9 +508,11 @@ namespace ps2_stubs
             // closePacketGifTag below computes the appended qword count from the
             // write-cursor delta and ADDS it to this seed; pre-seeding nloop=4 made it
             // double-count (nloop=8 for a 4-register tag), starving the following
-            // IMAGE/CLUT upload. Final tag after close = 0x1000000000000004,
-            // byte-identical to hardware.
-            const uint64_t giftag[2] = {(1ULL << 60), 0xEULL};
+            // IMAGE/CLUT upload. After close this finalizes to 0x1000000000000004
+            // (nloop=4, nreg=1, A+D, eop=0) -- the value the regression test pins.
+            // EOP must stay clear on this chained/open tag (its nloop is filled in
+            // by close), so makeGiftagAplusDOpen is used rather than makeGiftagAplusD.
+            const uint64_t giftag[2] = {makeGiftagAplusDOpen(0u), 0xEULL};
             uint32_t currentAddr = packetAddr + 16u;
             writeGuestBytes(rdram, runtime, currentAddr, reinterpret_cast<const uint8_t *>(giftag), sizeof(giftag));
             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr + 16u);

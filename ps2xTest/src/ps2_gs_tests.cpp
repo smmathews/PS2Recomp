@@ -3233,6 +3233,27 @@ void register_ps2_gs_tests()
             t.Equals(reg2Desc, static_cast<uint64_t>(0x51ULL), "second register qword should be TRXPOS (0x51)");
             t.Equals(reg3Desc, static_cast<uint64_t>(0x52ULL), "third register qword should be TRXREG (0x52)");
             t.Equals(reg4Desc, static_cast<uint64_t>(0x53ULL), "fourth register qword should be TRXDIR (0x53)");
+
+            uint64_t reg1Payload = 0u;
+            uint64_t reg2Payload = 0u;
+            uint64_t reg3Payload = 0u;
+            uint64_t reg4Payload = 0u;
+            std::memcpy(&reg1Payload, rdram.data() + baseAddr + 32u + 0u * 16u + 0u, sizeof(reg1Payload));
+            std::memcpy(&reg2Payload, rdram.data() + baseAddr + 32u + 1u * 16u + 0u, sizeof(reg2Payload));
+            std::memcpy(&reg3Payload, rdram.data() + baseAddr + 32u + 2u * 16u + 0u, sizeof(reg3Payload));
+            std::memcpy(&reg4Payload, rdram.data() + baseAddr + 32u + 3u * 16u + 0u, sizeof(reg4Payload));
+            // BITBLTBUF: dbp=0x3fc0 (bits 32-45), dbw=1 (bits 48-53), dpsm=0 (bits 56-61).
+            t.Equals(reg1Payload, static_cast<uint64_t>(0x00013FC000000000ULL),
+                      "BITBLTBUF payload must encode dbp=0x3fc0, dbw=1, dpsm=0");
+            // TRXPOS: dsax=0, dsay=0.
+            t.Equals(reg2Payload, static_cast<uint64_t>(0x0ULL),
+                      "TRXPOS payload must encode dsax=0, dsay=0");
+            // TRXREG: width=16 (bits 0-31), height=1 (bits 32-63).
+            t.Equals(reg3Payload, static_cast<uint64_t>(0x0000000100000010ULL),
+                      "TRXREG payload must encode width=16, height=1");
+            // TRXDIR: host-to-local transfer, dir=0.
+            t.Equals(reg4Payload, static_cast<uint64_t>(0x0ULL),
+                      "TRXDIR payload must encode dir=0 (host-to-local)");
         });
 
         tc.Run("sceGsResetGraph frees its temporary GIF packet", [](TestCase &t)
