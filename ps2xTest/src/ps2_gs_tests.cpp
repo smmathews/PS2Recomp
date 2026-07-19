@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fstream>
 #include <thread>
 #include <vector>
 
@@ -200,6 +201,25 @@ namespace
         const uint32_t pageOffset = (blockId >> 5u) << 13u;
         const uint32_t localBlock = blockId & 0x1Fu;
         return (page << 13u) + pageOffset + localBlock * 256u + kColumnTable8[y & 0x0Fu][x & 0x0Fu];
+    }
+
+    // Loads a checked-in binary fixture (PS2X_TEST_DATA_DIR, set by
+    // ps2xTest/CMakeLists.txt) into `vram` at byte offset `vramOffset`.
+    // Returns false if the fixture is missing/short so callers can fail
+    // the test with a clear message instead of silently sampling zeros.
+    bool loadOracleFixture(std::vector<uint8_t> &vram, uint32_t vramOffset, const char *fixtureName, size_t expectedBytes)
+    {
+        const std::string path = std::string(PS2X_TEST_DATA_DIR) + "/" + fixtureName;
+        std::ifstream in(path, std::ios::binary);
+        if (!in)
+            return false;
+        std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (bytes.size() != expectedBytes)
+            return false;
+        if (vramOffset + bytes.size() > vram.size())
+            return false;
+        std::memcpy(vram.data() + vramOffset, bytes.data(), bytes.size());
+        return true;
     }
 
     uint32_t referenceAddrPSMCT32(uint32_t block, uint32_t width, uint32_t x, uint32_t y)
@@ -2182,6 +2202,181 @@ void register_ps2_gs_tests()
                        ", got " + std::to_string(got) +
                        ", expected " + std::to_string(expected) + ")");
             }
+        });
+
+        tc.Run("GS multi-page CT32-as-T8 sampling matches real oracle VRAM (DQ8 Level-5/SE-logo texture, candidate C2)", [](TestCase &t)
+        {
+            // Pins candidate C2 from dq8/research/RESEARCH-2026-07-18-level5-ee-dma-trace.md
+            // and dq8/PS2_PROJECT_STATE.md §3.30: a hypothesized page/row-stride
+            // mismatch between the CT32 write-side addressing (addrPSMCT32, what
+            // the guest used to upload its logo/title texture atlas) and the
+            // PSMT8 read-side addressing (addrPSMT8, what our sampleTexture path
+            // uses to read it back as an 8bpp CLUT-indexed texture) at REAL
+            // multi-page game scale (tbw=8, tw=th=9 -> a 512x512 T8 sampling
+            // window, vs. the existing single-page test above which only covers
+            // one 64x32 CT32 / 128x64 T8 page and is blind to multi-page
+            // aliasing).
+            //
+            // Ground truth here is NOT a synthetic write-via-prod/read-via-prod
+            // round trip (blind to this class of bug by construction) but real
+            // GS VRAM bytes captured from a PCSX2 savestate at the DQ8 SE-logo
+            // screen (SLUS_212.07), together with the TEX0_1 register decoded
+            // from the SAME savestate at the SAME instant (GS.bin, ~509-byte
+            // header + 4MB VRAM; TEX0 found via bit-pattern scan of the header,
+            // byte offset 132, raw value 0x2007ef0665322a80) -- so VRAM content
+            // and the TEX0 that samples it are guaranteed mutually consistent.
+            // Decoded TEX0_1: tbp0=0x2a80 tbw=8 psm=T8(0x13) tw=9 th=9
+            // cbp=0x3f78 cpsm=CT32 csm=0(CSM1) csa=0 cld=1 -- this exact tuple
+            // is independently confirmed in /tmp/dq8diag/20260718-l5-diag3/boot.log
+            // ([gs:tex0-change] ctx=0 tbp0=0x2a80 ... cbp=0x3f78 ...), so it is
+            // not a one-off savestate artifact.
+            //
+            // Fixtures (checked in, see ps2xTest/data/):
+            //  - level5_oracle_tex_2a80.bin: 32 pages (262144 bytes) of real GS
+            //    VRAM starting at the page-aligned base of block 0x2a80 -- big
+            //    enough to cover every address addrPSMT8(0x2a80, 8, x, y) can
+            //    produce for the full declared 512x512 (tw=th=9) domain.
+            //  - level5_oracle_clut_3f78.bin: the one page containing the
+            //    256-entry CSM1 CLUT at block 0x3f78.
+            //
+            // What this test actually checks (two independent, falsifiable
+            // properties -- deliberately NOT "does it look right", which is
+            // unfalsifiable in an automated test):
+            //
+            //  1. BIJECTIVITY of the read-side addressing over the declared
+            //     multi-page domain. A genuine page/row-stride MISMATCH between
+            //     the write-side pagesPerRow (dbw-derived) and the read-side
+            //     pagesPerRow (tbw-derived) is exactly what would make
+            //     addrPSMT8 revisit some VRAM bytes multiple times from
+            //     different (x,y) while never visiting others -- the literal
+            //     mechanism of a "duplicate band" artifact. For tbw=8 (matching
+            //     this real TEX0), pagesPerRow = tbw>>1 = 4, which equals dbw=4
+            //     for the CT32 write side (confirmed by brute-force search over
+            //     dbw candidates 2/3/4/5/6/8 against these same oracle bytes:
+            //     only dbw=4 decodes the CT32 upload into a single coherent
+            //     256-wide band; dbw=8 visibly splits/duplicates it). Matching
+            //     pagesPerRow is necessary for the two addressings to be
+            //     consistent; this assertion directly tests it holds in practice
+            //     for the full 512x512 read domain, not just algebraically.
+            //  2. The decoded pixels, run through the REAL production pipeline
+            //     (GSRasterizer::sampleTexture -> inline PSMT8 texel read
+            //     (GSPSMT8::addrPSMT8) -> GSRasterizer::lookupCLUT), reproduce
+            //     the expected "SQUARE ENIX" wordmark silhouette at a fixed,
+            //     hand-identified sample point (a texel inside the "S" glyph
+            //     stem that is opaque/white in the oracle in every VRAM dump
+            //     taken of this savestate) and expected background (mid-gray,
+            //     CLUT entry 0) well outside the glyph band -- i.e. the
+            //     multi-page decode is legible art, not scrambled noise, at
+            //     these known-good/known-background points.
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+
+            const bool haveTex = loadOracleFixture(vram, 0x2a8000u, "level5_oracle_tex_2a80.bin", 262144u);
+            const bool haveClut = loadOracleFixture(vram, 0x3f6000u, "level5_oracle_clut_3f78.bin", 8192u);
+            if (!haveTex || !haveClut)
+            {
+                t.Fail("could not load DQ8 Level-5/SE-logo oracle VRAM fixtures from PS2X_TEST_DATA_DIR "
+                       "(expected ps2xTest/data/level5_oracle_tex_2a80.bin and level5_oracle_clut_3f78.bin)");
+                return;
+            }
+
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            // Moment-accurate TEX0_1, decoded field-by-field (see comment
+            // above) rather than poked as one raw hex constant, so the test
+            // stays self-documenting.
+            constexpr uint32_t kTbp0 = 0x2a80u;
+            constexpr uint32_t kTbw = 8u;
+            constexpr uint32_t kPsm = GS_PSM_T8;
+            constexpr uint32_t kTw = 9u;
+            constexpr uint32_t kTh = 9u;
+            constexpr uint32_t kCbp = 0x3f78u;
+            constexpr uint32_t kCpsm = GS_PSM_CT32;
+            constexpr uint32_t kCsm = 0u;
+            constexpr uint32_t kCsa = 0u;
+            constexpr uint32_t kCld = 1u;
+            const uint64_t tex0Value =
+                (static_cast<uint64_t>(kTbp0) << 0) |
+                (static_cast<uint64_t>(kTbw) << 14) |
+                (static_cast<uint64_t>(kPsm) << 20) |
+                (static_cast<uint64_t>(kTw) << 26) |
+                (static_cast<uint64_t>(kTh) << 30) |
+                (static_cast<uint64_t>(1u) << 34) | // TCC
+                (static_cast<uint64_t>(0u) << 35) | // TFX
+                (static_cast<uint64_t>(kCbp) << 37) |
+                (static_cast<uint64_t>(kCpsm) << 51) |
+                (static_cast<uint64_t>(kCsm) << 55) |
+                (static_cast<uint64_t>(kCsa) << 56) |
+                (static_cast<uint64_t>(kCld) << 61);
+            gs.writeRegister(GS_REG_TEX0_1, tex0Value);
+
+            // PRIM: TME=1 (bit4), FST=1 (bit8, so sampleTexture's u/v path is
+            // used directly in 1/16th-texel fixed point), CTXT=0 (bit9,
+            // context 1 == TEX0_1). PRMODECONT defaults true so this PRIM
+            // write does take effect.
+            gs.writeRegister(GS_REG_PRIM, (1ull << 4) | (1ull << 8));
+
+            GSRasterizer rast;
+
+            // --- Property 1: bijectivity of the read-side addressing over
+            // the full declared 512x512 domain (tw=th=9). ---
+            std::vector<uint8_t> seen(PS2_GS_VRAM_SIZE, 0u);
+            uint32_t collisions = 0u;
+            uint32_t firstCollideX = 0u, firstCollideY = 0u;
+            const uint32_t texDomain = 1u << kTw; // == 1u << kTh here
+            for (uint32_t y = 0; y < texDomain && collisions == 0u; ++y)
+            {
+                for (uint32_t x = 0; x < texDomain; ++x)
+                {
+                    const uint32_t off = GSPSMT8::addrPSMT8(kTbp0, kTbw, x, y);
+                    if (off < seen.size())
+                    {
+                        if (seen[off])
+                        {
+                            collisions = 1u;
+                            firstCollideX = x;
+                            firstCollideY = y;
+                            break;
+                        }
+                        seen[off] = 1u;
+                    }
+                }
+            }
+            t.Equals(collisions, 0u,
+                     "addrPSMT8(tbp0=0x2a80, tbw=8, ...) should be a bijection over the declared "
+                     "512x512 domain (no address hit twice); a page/row-stride mismatch vs the "
+                     "CT32 write side (dbw=4) would show up here as a collision, first at x=" +
+                     std::to_string(firstCollideX) + ", y=" + std::to_string(firstCollideY));
+
+            // --- Property 2: the real pipeline decodes legible art at known
+            // sample points, not scrambled noise. Coordinates and expected
+            // colors were established by directly decoding these exact
+            // fixture bytes offline (brute-force scan of the glyph row band
+            // for a saturated-white sample, and confirming CLUT entry 0 is
+            // opaque black -- not the mid-gray a naive alpha=128-over-white
+            // preview would suggest): (343,199) lands on a glyph stroke
+            // (near-white, CLUT-decoded ~ (202,202,202)), (16,16) is
+            // comfortably outside the glyph band (background, CLUT entry 0,
+            // opaque black). ---
+            const uint32_t glyphColor = rast.sampleTexture(&gs, 0.0f, 0.0f, 1.0f,
+                                                            static_cast<uint16_t>(343 * 16),
+                                                            static_cast<uint16_t>(199 * 16));
+            const uint32_t bgColor = rast.sampleTexture(&gs, 0.0f, 0.0f, 1.0f,
+                                                        static_cast<uint16_t>(16 * 16),
+                                                        static_cast<uint16_t>(16 * 16));
+
+            auto channel = [](uint32_t rgba, int shift) { return static_cast<int>((rgba >> shift) & 0xFFu); };
+            const int glyphR = channel(glyphColor, 0), glyphG = channel(glyphColor, 8), glyphB = channel(glyphColor, 16);
+            const int bgR = channel(bgColor, 0), bgG = channel(bgColor, 8), bgB = channel(bgColor, 16);
+
+            t.IsTrue(glyphR > 180 && glyphG > 180 && glyphB > 180,
+                     "known glyph-stroke texel (343,199) should decode near-white through the real "
+                     "sampleTexture/addrPSMT8/lookupCLUT pipeline, got rgb(" +
+                     std::to_string(glyphR) + "," + std::to_string(glyphG) + "," + std::to_string(glyphB) + ")");
+            t.IsTrue(bgR < 16 && bgG < 16 && bgB < 16,
+                     "known background texel (16,16) should decode to opaque black (CLUT entry 0) "
+                     "through the real pipeline, got rgb(" +
+                     std::to_string(bgR) + "," + std::to_string(bgG) + "," + std::to_string(bgB) + ")");
         });
 
         tc.Run("GS PSMT4 local-local copy respects swizzled page layout", [](TestCase &t)

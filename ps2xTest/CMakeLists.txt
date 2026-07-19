@@ -27,12 +27,20 @@ target_include_directories(ps2_test_lib PRIVATE
     ${CMAKE_SOURCE_DIR}/ps2xRecomp/include
     ${CMAKE_SOURCE_DIR}/ps2xAnalyzer/include
     ${CMAKE_SOURCE_DIR}/ps2xRuntime/include
+    ${CMAKE_SOURCE_DIR}/ps2xRuntime/src/lib
 )
 
 target_link_libraries(ps2_test_lib PRIVATE
     ps2_recomp_lib
     ps2_analyzer_lib
     ps2_runtime
+)
+
+# Absolute path to checked-in binary test fixtures (e.g. oracle GS VRAM
+# excerpts), so oracle-byte tests can locate their data regardless of the
+# test binary's working directory.
+target_compile_definitions(ps2_test_lib PRIVATE
+    PS2X_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
 )
 
 add_executable(ps2x_tests

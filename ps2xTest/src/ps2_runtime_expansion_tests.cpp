@@ -14,6 +14,7 @@
 #include "Stubs/Audio.h"
 #include "Stubs/GS.h"
 #include "Stubs/VU.h"
+#include "runtime/ps2_sounddriver.h"     // PS2SoundDriverGameLayout (used by Kernel/Syscalls/Helpers/State.h)
 #include "Kernel/Syscalls/Interrupt.h"   // interrupt_state::g_vsync_waitList, WaitForNextVSyncTick, EnsureVSyncWorkerRunning, stopInterruptWorker
 
 #include <atomic>
