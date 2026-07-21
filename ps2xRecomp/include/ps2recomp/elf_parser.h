@@ -1,10 +1,10 @@
 #ifndef PS2RECOMP_ELF_PARSER_H
 #define PS2RECOMP_ELF_PARSER_H
 
-// ELFIO's elf_types.hpp uses fixed-width integer types (uint16_t/uint32_t/...) without
-// including <cstdint> itself; it has always relied on some other standard header pulling
-// it in transitively first. Include it explicitly here so this keeps building regardless
-// of what a given standard library implementation transitively provides.
+// ELFIO (Release_3.12, vendored via FetchContent) uses uint16_t/uint32_t/uint64_t
+// in elf_types.hpp without including <cstdint> itself. Newer libstdc++ releases
+// trimmed the transitive includes that used to pull those typedefs in, so this
+// header must guarantee they're visible before elfio.hpp is processed.
 #include <cstdint>
 #include <elfio/elfio.hpp>
 #include <string>

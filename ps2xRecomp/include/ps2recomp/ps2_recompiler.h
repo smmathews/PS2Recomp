@@ -13,6 +13,7 @@
 #include <map>
 #include <istream>
 #include <functional>
+#include <utility>
 
 namespace ps2recomp
 {
@@ -68,6 +69,10 @@ namespace ps2recomp
             const std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
             const std::vector<Function> &functions,
             const std::vector<Section> &sections);
+
+        static std::vector<std::string> ComputeOversizedTranslationUnits(
+            const std::vector<std::pair<std::string, size_t>>& translationUnitInstructionCounts,
+            uint32_t instructionThreshold);
 
     private:
         ConfigManager m_configManager;
