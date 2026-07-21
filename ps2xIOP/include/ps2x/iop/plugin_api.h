@@ -254,6 +254,10 @@ extern "C"
                                          uint32_t a3,
                                          uint32_t *result_address);
         void (*log)(void *userdata, uint32_t level, ps2x_iop_string_view_v1 message);
+
+        size_t (*feed_mpeg_cd_stream)(void *userdata, const void *data, size_t size);
+        void (*notify_mpeg_cd_stream_start)(void *userdata);
+        void (*notify_mpeg_cd_stream_eof)(void *userdata);
     } ps2x_iop_host_api_v1;
 
     typedef void *(*ps2x_iop_profile_create_v1)(const ps2x_iop_host_api_v1 *host,

@@ -15,6 +15,8 @@ namespace
     constexpr uint32_t kSyntheticCrc32 = 0xA1B2C3D4u;
     constexpr uint32_t kResponseXor = 0xA5A55A5Au;
     constexpr uint32_t kCoreCollisionResponse = 0xC0DEF00Du;
+    constexpr uint32_t kMpegFeedFunction = 0x77u;
+    constexpr uint8_t kFeedPattern[] = {0xDEu, 0xADu, 0xBEu, 0xEFu};
 
     template <size_t Size>
     constexpr ps2x_iop_string_view_v1 stringView(const char (&value)[Size])
@@ -125,6 +127,23 @@ namespace
             ++state->rpcCalls;
             result->handled = 1u;
             result->result_address = request->receive.address;
+            return PS2X_IOP_STATUS_OK_V1;
+        }
+
+        if (request->sid == kSyntheticSid && request->function == kMpegFeedFunction)
+        {
+            if (state->host->notify_mpeg_cd_stream_start)
+                state->host->notify_mpeg_cd_stream_start(state->host->userdata);
+            const size_t consumed = state->host->feed_mpeg_cd_stream
+                ? state->host->feed_mpeg_cd_stream(state->host->userdata,
+                                                    kFeedPattern, sizeof(kFeedPattern))
+                : 0u;
+            if (state->host->notify_mpeg_cd_stream_eof)
+                state->host->notify_mpeg_cd_stream_eof(state->host->userdata);
+            result->handled = 1u;
+            // result_address carries no guest address here; it relays the consumed
+            // byte count back to the test.
+            result->result_address = static_cast<uint32_t>(consumed);
             return PS2X_IOP_STATUS_OK_V1;
         }
 

@@ -81,6 +81,10 @@ public:
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 
+    size_t feedMpegCdStream(const uint8_t *data, size_t size) override;
+    void notifyMpegCdStreamStart() override;
+    void notifyMpegCdStreamEof() override;
+
 private:
     friend class CallScope;
 

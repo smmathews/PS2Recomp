@@ -34,6 +34,7 @@ namespace
     constexpr uint32_t kSyntheticCrc32 = 0xA1B2C3D4u;
     constexpr uint32_t kResponseXor = 0xA5A55A5Au;
     constexpr uint32_t kCoreCollisionResponse = 0xC0DEF00Du;
+    constexpr uint32_t kMpegFeedFunction = 0x77u;
 
     class FakeIopHost final : public IopHost
     {
@@ -256,6 +257,25 @@ namespace
             logs.emplace_back(level, std::string(message));
         }
 
+        size_t feedMpegCdStream(const uint8_t *data, size_t size) override
+        {
+            if (data)
+            {
+                mpegFedBytes.assign(data, data + size);
+            }
+            return size;
+        }
+
+        void notifyMpegCdStreamStart() override
+        {
+            ++mpegStreamStarts;
+        }
+
+        void notifyMpegCdStreamEof() override
+        {
+            ++mpegStreamEofs;
+        }
+
         bool writeWord(uint32_t address, uint32_t value)
         {
             return writeGuest(address, &value, sizeof(value));
@@ -295,6 +315,9 @@ namespace
         std::unordered_map<uint64_t, std::string> openHostFiles;
         std::vector<uint64_t> closedHostFileHandles;
         uint64_t nextHostFileHandle = 1u;
+        std::vector<uint8_t> mpegFedBytes;
+        uint32_t mpegStreamStarts = 0u;
+        uint32_t mpegStreamEofs = 0u;
 
     private:
         bool contains(uint32_t address, size_t size) const
@@ -810,6 +833,35 @@ void register_ps2_iop_tests()
                      "plugin profile destroy callback should run when the active profile is replaced");
             t.IsTrue(subsystem.debugSnapshot().activeProfile.empty(),
                      "switching to an unmatched ELF should leave no active profile");
+        });
+
+        tc.Run("IOP plugin feeds the MPEG decoder through the host bridge", [](TestCase &t)
+        {
+            FakeIopHost host;
+            ps2x::iop::IopSubsystem subsystem(host);
+            const std::filesystem::path pluginDirectory(PS2X_TEST_IOP_PLUGIN_DIR);
+            subsystem.setPluginSearchPaths({pluginDirectory});
+
+            std::string error;
+            t.IsTrue(subsystem.loadPlugins(&error), "synthetic IOP plugin discovery should succeed");
+            t.IsTrue(subsystem.configure({"synthetic_iop_test.elf", kSyntheticEntryPoint, kSyntheticCrc32}, &error),
+                     "the synthetic ELF identity should activate the plugin profile");
+
+            ps2x::iop::RpcRequest request{};
+            request.sid = kSyntheticSid;
+            request.function = kMpegFeedFunction;
+            const ps2x::iop::RpcResult result = subsystem.handleRpc(request);
+
+            t.IsTrue(result.handled, "the MPEG feed function should dispatch to the plugin");
+            t.Equals(result.resultAddress, uint32_t{4},
+                     "plugin should see the feed report all bytes consumed");
+            t.Equals(host.mpegStreamStarts, uint32_t{1},
+                     "the bridge should forward the stream-start notification");
+            t.Equals(host.mpegStreamEofs, uint32_t{1},
+                     "the bridge should forward the stream-eof notification");
+            const std::vector<uint8_t> expected = {0xDEu, 0xADu, 0xBEu, 0xEFu};
+            t.IsTrue(host.mpegFedBytes == expected,
+                     "the bridge should marshal the exact fed bytes through to the host");
         });
 #endif
     });
