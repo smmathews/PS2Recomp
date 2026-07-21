@@ -125,6 +125,9 @@ namespace ps2x::iop::detail
                 api.has_guest_function = &hasGuestFunction;
                 api.invoke_guest_function = &invokeGuestFunction;
                 api.log = &log;
+                api.feed_mpeg_cd_stream = &feedMpegCdStream;
+                api.notify_mpeg_cd_stream_start = &notifyMpegCdStreamStart;
+                api.notify_mpeg_cd_stream_eof = &notifyMpegCdStreamEof;
             }
 
             ps2x_iop_host_api_v1 api{};
@@ -432,6 +435,37 @@ namespace ps2x::iop::detail
                             { self(userdata)->host.log(
                                   converted,
                                   std::string_view(message.data ? message.data : "", message.size)); });
+            }
+
+            static size_t feedMpegCdStream(void *userdata, const void *data, size_t size)
+            {
+                if (!userdata || (!data && size != 0))
+                {
+                    return 0u;
+                }
+                return guardedValue<size_t>(0u, [&]()
+                                            { return self(userdata)->host.feedMpegCdStream(
+                                                  static_cast<const uint8_t *>(data), size); });
+            }
+
+            static void notifyMpegCdStreamStart(void *userdata)
+            {
+                if (!userdata)
+                {
+                    return;
+                }
+                guardedVoid([&]()
+                            { self(userdata)->host.notifyMpegCdStreamStart(); });
+            }
+
+            static void notifyMpegCdStreamEof(void *userdata)
+            {
+                if (!userdata)
+                {
+                    return;
+                }
+                guardedVoid([&]()
+                            { self(userdata)->host.notifyMpegCdStreamEof(); });
             }
         };
 

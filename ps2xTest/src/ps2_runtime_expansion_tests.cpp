@@ -5,6 +5,7 @@
 #include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include "ps2_runtime.h"
+#include "ps2_iop_host.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
@@ -1102,6 +1103,43 @@ void register_ps2_runtime_expansion_tests()
 
             t.Equals(ps2_stubs::feedMpegCdStreamBytes(packet.data(), packet.size()), static_cast<size_t>(0u),
                      "feedMpegCdStreamBytes with no active CD stream (handle exists but generation 0) should not consume bytes");
+        });
+
+        tc.Run("PS2IopHostAdapter forwards the MPEG feed to the runtime decoder", [](TestCase &t)
+        {
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+
+            constexpr uint32_t kMpegAddr = 0x00123000u;
+            constexpr uint32_t kWorkAddr = 0x00140000u;
+
+            R5900Context createCtx{};
+            setRegU32(createCtx, 4, kMpegAddr);
+            setRegU32(createCtx, 5, kWorkAddr);
+            setRegU32(createCtx, 6, 0x2000u);
+            ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, nullptr);
+
+            PS2Runtime runtime;
+            PS2IopHostAdapter adapter(runtime);
+
+            const std::vector<uint8_t> programEnd = {0x00u, 0x00u, 0x01u, 0xB9u};
+
+            t.Equals(adapter.feedMpegCdStream(programEnd.data(), programEnd.size()), size_t{0u},
+                     "adapter feed before CD stream start should be a no-op");
+
+            adapter.notifyMpegCdStreamStart();
+            const size_t consumed = adapter.feedMpegCdStream(programEnd.data(), programEnd.size());
+            t.Equals(consumed, programEnd.size(), "adapter feed should report the input range consumed");
+
+            R5900Context isEndCtx{};
+            setRegU32(isEndCtx, 4, kMpegAddr);
+            ps2_stubs::sceMpegIsEnd(rdram.data(), &isEndCtx, nullptr);
+            t.Equals(getRegS32(isEndCtx, 2), 1,
+                     "adapter-fed bytes should reach the decoder (no guest demux)");
+
+            adapter.notifyMpegCdStreamEof();
+            t.Equals(adapter.feedMpegCdStream(programEnd.data(), programEnd.size()), size_t{0u},
+                     "adapter feed after CD EOF should be a no-op");
         });
 
         tc.Run("host feed fans out to every open decoder and reports the input range once", [](TestCase &t)

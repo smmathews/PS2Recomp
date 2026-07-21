@@ -91,5 +91,9 @@ namespace ps2x::iop
                                          uint32_t *resultAddress) = 0;
 
         virtual void log(LogLevel level, std::string_view message) = 0;
+
+        virtual size_t feedMpegCdStream(const uint8_t *data, size_t size) = 0;
+        virtual void notifyMpegCdStreamStart() = 0;
+        virtual void notifyMpegCdStreamEof() = 0;
     };
 }

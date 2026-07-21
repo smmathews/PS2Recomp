@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/MemoryCard.h"
+#include "Kernel/Stubs/MPEG.h"
 #include "Kernel/Syscalls/Common.h"
 
 #include <algorithm>
@@ -500,4 +501,19 @@ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
         prefix = "[ps2xIOP:error]";
     }
     std::cerr << prefix << ' ' << message << std::endl;
+}
+
+size_t PS2IopHostAdapter::feedMpegCdStream(const uint8_t *data, size_t size)
+{
+    return ps2_stubs::feedMpegCdStreamBytes(data, size);
+}
+
+void PS2IopHostAdapter::notifyMpegCdStreamStart()
+{
+    ps2_stubs::notifyMpegCdStreamStart();
+}
+
+void PS2IopHostAdapter::notifyMpegCdStreamEof()
+{
+    ps2_stubs::notifyMpegCdStreamEof();
 }
