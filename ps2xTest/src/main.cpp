@@ -40,6 +40,7 @@ void register_scheduler_join_priority_tests();
 void register_scheduler_park_window_tests();
 void register_scheduler_fiber_ptr_tests();
 void register_ps2_observability_tests();
+void register_present_layout_tests();
 void reset_ps2_test_function_table();
 void register_scheduler_token_handoff_tests();
 void register_scheduler_rpc_loop_park_tests();
@@ -102,6 +103,7 @@ int main()
     register_scheduler_override_isolation_tests();
     register_scheduler_join_starvation_tests();
     register_ps2_observability_tests();
+    register_present_layout_tests();
     int res = MiniTest::Run();
     std::cout.flush();
     std::cerr.flush();

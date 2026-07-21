@@ -61,6 +61,7 @@ add_library(ps2_test_lib STATIC
     src/ps2_scheduler_workload_regression_tests.cpp
     src/ps2_observability_tests.cpp
     src/ps2_mpeg_pacing_tests.cpp
+    src/present_layout_tests.cpp
 )
 
 target_include_directories(ps2_test_lib PRIVATE
