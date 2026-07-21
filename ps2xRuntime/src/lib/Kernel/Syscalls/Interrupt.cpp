@@ -4,6 +4,8 @@
 #include "Stubs/GS.h"
 #include "ps2_fiber.h"
 
+#include <bit>
+
 namespace ps2_syscalls
 {
     namespace interrupt_state
@@ -30,6 +32,11 @@ namespace ps2_syscalls
         constexpr uint32_t kAsyncHandlerStackSize = 0x4000u; // 16 KB, one pool slot
         uint64_t g_vsync_tick_counter = 0u;
         VSyncFlagRegistration g_vsync_registration{};
+
+        std::atomic<uint32_t> g_pending_intc_causes{0u};              // bitmask, one pending bit per cause
+        std::atomic<uint32_t> g_pending_intc_age[32] = {};            // drain ticks since raise, per cause
+        // The age entries are atomic because raisePendingIntc (any thread) resets
+        // an age while the interrupt worker thread increments it in drainPendingIntc.
     }
 
     using namespace interrupt_state;
@@ -239,10 +246,199 @@ namespace ps2_syscalls
         }
     }
 
-    static void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
+    static int dispatchAndCountIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
-        dispatchHandlersForCause(rdram, runtime, cause, g_intcHandlers,
-                                  g_enabled_intc_mask.load(std::memory_order_acquire), "INTC");
+        if (!rdram || !runtime)
+        {
+            return 0;
+        }
+
+        std::vector<IrqHandlerInfo> handlers;
+        {
+            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
+            if (cause < 32u && (g_enabled_intc_mask & (1u << cause)) == 0u)
+            {
+                return 0;
+            }
+
+            handlers.reserve(g_intcHandlers.size());
+            for (const auto &[id, info] : g_intcHandlers)
+            {
+                (void)id;
+                if (!info.enabled)
+                {
+                    continue;
+                }
+                if (info.cause != cause)
+                {
+                    continue;
+                }
+                if (info.handler == 0u)
+                {
+                    continue;
+                }
+                handlers.push_back(info);
+            }
+            std::sort(handlers.begin(), handlers.end(), [](const IrqHandlerInfo &a, const IrqHandlerInfo &b)
+                      { return a.order < b.order; });
+        }
+
+        int dispatchedCount = 0;
+        for (const IrqHandlerInfo &info : handlers)
+        {
+            if (!runtime->hasFunction(info.handler))
+            {
+                if (cause == kIntcVblankStart)
+                {
+                    PS2_IF_AGRESSIVE_LOGS({
+                        static std::atomic<uint32_t> s_missingHandlerLogCount{0u};
+                        const uint32_t logIndex = s_missingHandlerLogCount.fetch_add(1u, std::memory_order_relaxed);
+                        if (logIndex < 32u)
+                        {
+                            auto flags = std::cout.flags();
+                            std::cout << "[INTC:missing] cause=" << cause
+                                      << " handler=0x" << std::hex << info.handler
+                                      << std::dec
+                                      << " id=" << info.id
+                                      << std::endl;
+                            std::cout.flags(flags);
+                        }
+                    });
+                }
+                continue;
+            }
+
+            ++dispatchedCount;
+            try
+            {
+                R5900Context irqCtx{};
+                SET_GPR_U32(&irqCtx, 28, info.gp);
+                SET_GPR_U32(&irqCtx, 29, getAsyncHandlerStackTop(runtime));
+                SET_GPR_U32(&irqCtx, 31, 0u);
+                SET_GPR_U32(&irqCtx, 4, cause);
+                SET_GPR_U32(&irqCtx, 5, info.arg);
+                SET_GPR_U32(&irqCtx, 6, 0u);
+                SET_GPR_U32(&irqCtx, 7, 0u);
+                irqCtx.pc = info.handler;
+
+                while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested())
+                {
+                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
+                    if (!step)
+                    {
+                        break;
+                    }
+                    // Interrupt handlers must be able to preempt a guest thread that is
+                    // spinning on interrupt-produced state, such as a vblank counter.
+                    step(rdram, &irqCtx, runtime);
+                }
+            }
+            catch (const ThreadExitException &)
+            {
+            }
+            catch (const std::exception &e)
+            {
+                static uint32_t warnCount = 0;
+                if (warnCount < 8u)
+                {
+                    std::cerr << "[INTC] handler 0x" << std::hex << info.handler
+                              << " threw exception: " << e.what() << std::dec << std::endl;
+                    ++warnCount;
+                }
+            }
+        }
+
+        return dispatchedCount;
+    }
+
+    void raisePendingIntc(uint32_t cause)
+    {
+        if (cause >= 32u || cause == kIntcVblankStart || cause == kIntcVblankEnd)
+        {
+            return;
+        }
+
+        const uint32_t bit = 1u << cause;
+        const uint32_t prev = g_pending_intc_causes.fetch_or(bit, std::memory_order_acq_rel);
+        if ((prev & bit) == 0u)
+        {
+            g_pending_intc_age[cause].store(0u, std::memory_order_relaxed); // fresh raise: age restarts
+            PS2_IF_AGRESSIVE_LOGS({
+                static std::atomic<uint32_t> s_raiseLogCount{0u};
+                const uint32_t logIndex = s_raiseLogCount.fetch_add(1u, std::memory_order_relaxed);
+                if (logIndex < 16u || (logIndex % 256u) == 0u)
+                {
+                    RUNTIME_LOG("[INTC:raise] cause=" << cause);
+                }
+            });
+        }
+    }
+
+    void drainPendingIntc(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        uint32_t pending = g_pending_intc_causes.load(std::memory_order_acquire);
+        while (pending != 0u)
+        {
+            const uint32_t cause = static_cast<uint32_t>(std::countr_zero(pending));
+            const uint32_t bit = 1u << cause;
+            pending &= ~bit;
+
+            const int ran = dispatchAndCountIntcHandlersForCause(rdram, runtime, cause);
+            if (ran > 0)
+            {
+                // Level-triggered by design: delivery clears the single pending
+                // bit. If another raise of this same cause lands mid-drain
+                // (between the dispatch above and this fetch_and), the two raises
+                // collapse into one delivery. Accepted under the
+                // level-triggered design -- a set bit means "at least one pending",
+                // not a count -- a deliberate tradeoff, not a lost-wakeup bug.
+                g_pending_intc_causes.fetch_and(~bit, std::memory_order_acq_rel);
+                g_pending_intc_age[cause].store(0u, std::memory_order_relaxed);
+                PS2_IF_AGRESSIVE_LOGS({
+                    static std::atomic<uint32_t> s_deliverLogCount{0u};
+                    const uint32_t logIndex = s_deliverLogCount.fetch_add(1u, std::memory_order_relaxed);
+                    if (logIndex < 16u || (logIndex % 256u) == 0u)
+                    {
+                        RUNTIME_LOG("[INTC:deliver] cause=" << cause << " handlers=" << ran);
+                    }
+                });
+            }
+            else if (g_pending_intc_age[cause].fetch_add(1u, std::memory_order_relaxed) + 1u > kPendingIntcMaxAgeTicks)
+            {
+                g_pending_intc_causes.fetch_and(~bit, std::memory_order_acq_rel);
+                g_pending_intc_age[cause].store(0u, std::memory_order_relaxed);
+                PS2_IF_AGRESSIVE_LOGS({
+                    static std::atomic<uint32_t> s_dropLogCount{0u};
+                    const uint32_t logIndex = s_dropLogCount.fetch_add(1u, std::memory_order_relaxed);
+                    if (logIndex < 16u || (logIndex % 256u) == 0u)
+                    {
+                        RUNTIME_LOG("[INTC:drop] cause=" << cause << " aged out with no registered/enabled handler");
+                    }
+                });
+            }
+        }
+    }
+
+    void resetInterruptHandlerState()
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
+            g_intcHandlers.clear();
+            g_dmacHandlers.clear();
+            g_nextIntcHandlerId = 1;
+            g_nextDmacHandlerId = 1;
+            g_intc_head_order = 0;
+            g_intc_tail_order = 1000;
+            g_dmac_head_order = 0;
+            g_dmac_tail_order = 1000;
+            g_enabled_intc_mask = 0xFFFFFFFFu;
+            g_enabled_dmac_mask = 0xFFFFFFFFu;
+        }
+        g_pending_intc_causes.store(0u, std::memory_order_release);
+        for (auto &age : g_pending_intc_age)
+        {
+            age.store(0u, std::memory_order_relaxed);
+        }
     }
 
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
@@ -342,9 +538,10 @@ namespace ps2_syscalls
             {
                 const uint64_t tickValue = signalVSyncFlag(rdram, runtime);
                 ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
-                dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
+                dispatchAndCountIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
-                dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
+                dispatchAndCountIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
+                drainPendingIntc(rdram, runtime);
             }
         }
 
