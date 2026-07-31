@@ -49,13 +49,14 @@ namespace ps2_syscalls
             return out;
         }
 
-        // EE layout (kernel.h):
-        // [0]=count [1]=max_count [2]=init_count [3]=wait_threads [4]=attr [5]=option
+        // EE layout (ps2 sdk ee_sema_t):
+        // [0]=attr [1]=initCount [2]=maxCount [3]=waitThreads
+        // (maxCount=0 means no limit; the caller below clamps it to 1)
         const bool hasEeLayout = availableWords >= 3u;
-        const int eeMax = hasEeLayout ? static_cast<int>(param[1]) : 1;
-        const int eeInit = hasEeLayout ? static_cast<int>(param[2]) : 0;
-        const uint32_t eeAttr = (availableWords >= 5u) ? param[4] : 0u;
-        const uint32_t eeOption = (availableWords >= 6u) ? param[5] : 0u;
+        const int eeInit = hasEeLayout ? static_cast<int>(param[1]) : 0;
+        const int eeMax  = hasEeLayout ? static_cast<int>(param[2]) : 1;
+        const uint32_t eeAttr   = (availableWords >= 1u) ? param[0] : 0u;
+        const uint32_t eeOption = (availableWords >= 4u) ? param[3] : 0u;
 
         // Legacy layout (IOP-style):
         // [0]=attr [1]=option [2]=init [3]=max
@@ -71,8 +72,12 @@ namespace ps2_syscalls
         };
 
         bool useLegacyLayout = hasLegacyLayout && !hasEeLayout;
-        if (hasLegacyLayout && hasEeLayout && countLooksPlausible(legacyMax) && !countLooksPlausible(eeMax))
+        if (hasLegacyLayout && hasEeLayout && countLooksPlausible(legacyMax) && !countLooksPlausible(eeMax)
+            && !countLooksPlausible(eeInit))
         {
+            // Only prefer legacy when BOTH EE count fields are implausible.
+            // If eeInit looks valid (e.g. 1), the EE layout is correct and maxCount=0
+            // just means "no upper bound" (clamped to 1 below).
             useLegacyLayout = true;
         }
         else if (hasLegacyLayout && hasEeLayout && countLooksPlausible(legacyMax) && countLooksPlausible(eeMax))
