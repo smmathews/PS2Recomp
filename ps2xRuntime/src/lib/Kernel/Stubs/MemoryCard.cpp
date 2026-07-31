@@ -94,6 +94,54 @@ namespace ps2_stubs
         constexpr int32_t kCvMcConfigCapacityBytes = 0x00008000;
         constexpr int32_t kCvMcIconCapacityBytes = 0x00004000;
 
+        // ---------------------------------------------------------------
+        // libmc argument fetch for arguments 5..8.
+        //
+        // The EE ABI used by Sony's official toolchain (and therefore by
+        // every commercial title linked against Sony's libmc) is MIPS EABI:
+        // the first EIGHT integer arguments go in $a0-$a3 ($4-$7) and
+        // $t0-$t3 ($8-$11). It is NOT o32, which would spill arguments 5+
+        // to 16($sp)/20($sp).
+        //
+        // Reading them off the stack -- what these stubs used to do -- reads
+        // uninitialised stack for an EABI caller. Measured in DQ8
+        // (SLUS_212.07): across 49403 jal sites, 1414 set $t0 in the
+        // argument window and only 29 store to 0x10($sp). Two concrete call
+        // sites, both unambiguous:
+        //
+        //   0x0020da20  sceMcGetInfo(a0=port, a1=slot, a2=&type, a3=&free,
+        //                            t0=&format)          <- 5th arg in $t0
+        //   0x0020cfa0  sceMcGetDir (a0=port, a1=slot, a2=name, a3=mode,
+        //                            t0=maxent, t1=table) <- 5th, 6th in $t0/$t1
+        //
+        // Consequences of the old stack read, both observed:
+        //   * sceMcGetInfo never wrote `format` back to the guest, so DQ8's
+        //     own per-slot format check always saw 0 -- which is the "This
+        //     memory card has not been formatted. Format it now?" dialog
+        //     that made the New Game flow flaky.
+        //   * sceMcGetDir saw maxent=0 and table=NULL, so the boot-time
+        //     "/BASLUS-21207dq8???" probe that decides whether a save exists
+        //     always returned 0 entries -- i.e. no save was ever recognised,
+        //     including a perfectly good one copied in from an earlier run.
+        //
+        // The o32 stack slot is kept as a fallback for a hypothetical o32
+        // caller, used only when the EABI register is zero, so nothing that
+        // worked before can regress to reading less information than it did.
+        // ---------------------------------------------------------------
+        uint32_t readMcArgU32(uint8_t *rdram, R5900Context *ctx, int argIndex)
+        {
+            if (argIndex < 4)
+            {
+                return getRegU32(ctx, 4 + argIndex);
+            }
+            const uint32_t fromReg = getRegU32(ctx, 8 + (argIndex - 4));
+            if (fromReg != 0u)
+            {
+                return fromReg;
+            }
+            return readStackU32(rdram, ctx, 16 + 4 * (argIndex - 4));
+        }
+
         bool isValidMcPortSlot(int32_t port, int32_t slot)
         {
             // Backing state is per port (g_mcPorts); a slot indexes no state,
@@ -312,8 +360,34 @@ namespace ps2_stubs
             entry.EntryName[sizeof(entry.EntryName) - 1u] = '\0';
         }
 
-        bool wildcardMatch(const std::string &pattern, const std::string &value)
+        // A memory-card directory entry name lives in a FIXED-WIDTH, NUL-padded
+        // 32-byte field, and mcserv matches the pattern against that padded
+        // field. So '?' also matches the NUL padding past the end of a short
+        // name -- effectively "any character, or end of name".
+        //
+        // This is not a detail we can skip. DQ8 creates its save directories as
+        // "BASLUS-21207dq8_%d" (17 characters for a single-digit log slot) and
+        // then looks them up with the literal pattern "BASLUS-21207dq8???" (18
+        // characters, at 0x003990c0 in SLUS_212.07, used by the sceMcGetDir at
+        // 0x0020cfa0 that runs right after sceMcInit and decides whether the
+        // title menu has a save to Continue from). A strict "'?' matches
+        // exactly one real character" matcher rejects the game's OWN save
+        // directory, so the probe returns zero entries and no save is ever
+        // recognised -- including a known-good one copied in from an earlier
+        // run.
+        //
+        // Padding the value out to the pattern length with NULs before the
+        // ordinary matcher runs reproduces the hardware semantics exactly: a
+        // literal pattern character can never match a NUL (patterns are C
+        // strings and so contain none), '?' can, and '*' can.
+        bool wildcardMatch(const std::string &patternIn, const std::string &valueIn)
         {
+            const std::string &pattern = patternIn;
+            const std::string value =
+                (valueIn.size() < pattern.size())
+                    ? valueIn + std::string(pattern.size() - valueIn.size(), '\0')
+                    : valueIn;
+
             size_t patternPos = 0u;
             size_t valuePos = 0u;
             size_t starPos = std::string::npos;
@@ -689,8 +763,10 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
-        const int32_t maxEntries = static_cast<int32_t>(readStackU32(rdram, ctx, 16));
-        const uint32_t tableAddr = readStackU32(rdram, ctx, 20);
+        // Args 5 and 6 (maxent, table) -- see readMcArgU32: EABI registers,
+        // not the o32 stack slots.
+        const int32_t maxEntries = static_cast<int32_t>(readMcArgU32(rdram, ctx, 4));
+        const uint32_t tableAddr = readMcArgU32(rdram, ctx, 5);
 
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
@@ -846,7 +922,8 @@ namespace ps2_stubs
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const uint32_t typePtr = getRegU32(ctx, 6);
         const uint32_t freePtr = getRegU32(ctx, 7);
-        const uint32_t formatPtr = readStackU32(rdram, ctx, 16);
+        // Arg 5 (format out-pointer) -- see readMcArgU32: EABI register $t0.
+        const uint32_t formatPtr = readMcArgU32(rdram, ctx, 4);
 
         int32_t cardType = 0;
         int32_t freeBlocks = 0;
@@ -1082,12 +1159,38 @@ namespace ps2_stubs
                 {
                     const std::filesystem::path oldHostPath =
                         guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, oldPath));
-                    const std::filesystem::path newHostPath =
-                        guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, newPath));
+
+                    // libmc/mcserv semantics: the SECOND argument of
+                    // sceMcRename is a bare ENTRY NAME, not a path. The entry
+                    // is renamed IN PLACE, inside the directory the old entry
+                    // already lives in; any directory component in the new
+                    // name is ignored by real hardware.
+                    //
+                    // Resolving it as a guest path against the port's current
+                    // directory (what this used to do) silently MOVED files to
+                    // the memory-card root. DQ8 commits a save with a
+                    // rename-based two-phase protocol -- rename
+                    // "/BASLUS-21207dq8_N/icon.sys" -> "icon.err" while the
+                    // save is in flight, then rename "icon.err" -> "icon.sys"
+                    // to commit -- so phase 1 deposited the icon at
+                    // "<mcroot>/icon.err", phase 2's source no longer existed,
+                    // and every save DQ8 ever wrote here ended up with NO
+                    // icon.sys in its directory. See the leftover
+                    // "<mcroot>/icon.err" files (964 bytes, "PS2D" magic,
+                    // byte-identical to a correct icon.sys) next to every
+                    // BASLUS-21207dq8_* directory written before this fix.
+                    const std::vector<std::string> newParts = splitMcPathComponents(newPath);
+                    const std::string newName = newParts.empty() ? std::string{} : newParts.back();
+
                     std::error_code ec;
-                    if (std::filesystem::exists(oldHostPath, ec) && !ec &&
-                        std::filesystem::exists(newHostPath.parent_path(), ec) && !ec)
+                    if (newName.empty() || newName == "." || newName == "..")
                     {
+                        result = kMcResultDeniedPermit;
+                    }
+                    else if (std::filesystem::exists(oldHostPath, ec) && !ec)
+                    {
+                        const std::filesystem::path newHostPath =
+                            (oldHostPath.parent_path() / newName).lexically_normal();
                         std::filesystem::rename(oldHostPath, newHostPath, ec);
                         result = ec ? kMcResultDeniedPermit : kMcResultSucceed;
                     }
