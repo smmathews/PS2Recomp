@@ -1180,7 +1180,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // A DQ8 field/cutscene geometry list is ~4.6k tags (measured
+                    // on the oracle savestate's own chain at 0x004D0800), so the
+                    // old 4096 cap silently truncated the tail of every frame's
+                    // display list. The cap exists only to bound a corrupt
+                    // (self-referential) chain, so it can be far larger.
+                    const int kMaxChainTags = 65536;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
