@@ -1,6 +1,33 @@
 #include "runtime/ps2_gif_arbiter.h"
+#include "runtime/ps2_gs_gpu.h"
 #include <algorithm>
 #include <cstring>
+
+namespace
+{
+    // GsDump (PS2X_GS_DUMP, see ps2_gs_gpu.h/.cpp) records raw GIF path
+    // traffic in PCSX2's own on-disk GIF_PATH numbering, which is NOT the
+    // same as this runtime's internal GifPathId enum below. PCSX2:
+    // Path1=0, Path2=1, Path3=2, Path1New=3. This runtime's VU1 XGKICK
+    // traffic (GifPathId::Path1) is exactly the traffic a real PS2 submits
+    // through the "new" VU1-to-GIF route, so it maps to PCSX2's Path1New (3)
+    // -- matching the oracle DQ8 capture, where 100% of traffic is tagged
+    // path byte 3.
+    uint8_t gsDumpPathByte(GifPathId id)
+    {
+        switch (id)
+        {
+        case GifPathId::Path1:
+            return 3u; // PCSX2 GIF_PATH_1_NEW (VU1 XGKICK)
+        case GifPathId::Path2:
+            return 1u; // PCSX2 GIF_PATH_2
+        case GifPathId::Path3:
+            return 2u; // PCSX2 GIF_PATH_3
+        default:
+            return 3u;
+        }
+    }
+}
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
@@ -37,7 +64,23 @@ void GifArbiter::drain()
     if (!m_processFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
+    // Reentrancy-safe dispatch (M-T1 fix, generic): move the current queue
+    // out before processing. m_processFn ultimately reaches
+    // GS::processGIFPacket(), whose TRXDIR handling can synchronously
+    // trigger a local-to-local/local-to-host copy that (through the same
+    // DMA glue) re-enters submit()/drain(). Iterating m_queue in place
+    // while m_processFn can append to and re-drain THAT SAME vector meant
+    // a nested drain() re-walked entries the outer loop had already
+    // processed -- observed as a texture/CLUT upload's own 16-byte GIFtag
+    // reappearing a second time where its real pixel payload should be
+    // (byte-identical duplicate, confirmed via VRAM dump). Draining a
+    // locally-owned batch and leaving m_queue empty for the reentrant call
+    // makes double-processing structurally impossible regardless of the
+    // exact reentry path.
+    std::vector<GifArbiterPacket> batch = std::move(m_queue);
+    m_queue.clear();
+
+    std::stable_sort(batch.begin(), batch.end(),
                      [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                      {
                          // DIRECTHL cannot preempt PATH3 IMAGE transfers.
@@ -51,15 +94,25 @@ void GifArbiter::drain()
                          return pathPriority(a.pathId) < pathPriority(b.pathId);
                      });
 
-    for (size_t i = 0; i < m_queue.size(); ++i)
+    for (size_t i = 0; i < batch.size(); ++i)
     {
-        auto &pkt = m_queue[i];
+        auto &pkt = batch[i];
         if (!pkt.data.empty())
         {
+            if (GsDump::isEnabled())
+            {
+                GsDump::writeTransfer(gsDumpPathByte(pkt.pathId), pkt.data.data(),
+                                       static_cast<uint32_t>(pkt.data.size()));
+            }
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }
-    m_queue.clear();
+    // NOTE: do not clear m_queue here -- a reentrant submit() during the
+    // loop above (see the comment at the top of this function) may have
+    // queued NEW packets into m_queue that a nested drain() either already
+    // processed (leaving m_queue empty again) or hasn't yet (leaving them
+    // correctly pending for the next drain() call). Clearing unconditionally
+    // here would silently drop whichever case left m_queue non-empty.
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

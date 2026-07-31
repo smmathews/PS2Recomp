@@ -13,6 +13,43 @@
 #include "ps2_gs_rasterizer.h"
 #include "ps2_gs_memory.h"
 
+// ---------------------------------------------------------------------------
+// GS packet-stream dump (PS2X_GS_DUMP): env-gated capture of raw GIF path
+// traffic in a PCSX2 GSdump-compatible on-disk format, so our own runtime's
+// GS stream can be replayed offline through the same tooling that already
+// parses PCSX2 oracle .gs captures (vertex/ADC census, GIFtag mode, batch
+// topology). OFF by default; enable with PS2X_GS_DUMP=<path to output file>.
+//
+// This is declaration only. Do NOT add logic here: the format and the
+// enable/flush/close policy live in ps2_gs_gpu.cpp. All dump state is
+// file-scope in the .cpp, not a member of any struct with a corpus-visible
+// layout (PS2Memory, R5900Context, VU1State, VU1Interpreter, PS2Runtime are
+// never touched).
+namespace GsDump
+{
+    // One-time env check + file open (writes the format header). Idempotent
+    // and safe to call from multiple sites; only the first call does work.
+    void init();
+
+    // Cheap enabled check for hot-path call sites.
+    bool isEnabled();
+
+    // Records one GIF path Transfer packet exactly as submitted to the GIF
+    // unit (raw GIFtag + payload bytes, untouched). dumpPathByte follows
+    // PCSX2's own on-disk GIF_PATH numbering (0=Path1, 1=Path2, 2=Path3,
+    // 3=Path1New) so byte-for-byte the same "path" bucket lines up with an
+    // oracle capture, where VU1 XGKICK traffic is path 3. No-op if the dump
+    // is not enabled. Never truncates, samples, or rate-limits: every call
+    // while enabled is written in full.
+    void writeTransfer(uint8_t dumpPathByte, const uint8_t *data, uint32_t sizeBytes);
+
+    // Flush + close. Safe to call multiple times and from an atexit handler;
+    // a run that is killed with a catchable signal (SIGINT/SIGTERM) still
+    // leaves a parseable prefix because every writeTransfer() call is one
+    // fully-buffered packet followed by an explicit flush.
+    void shutdown();
+}
+
 enum GSPrimType : uint8_t
 {
     GS_PRIM_POINT = 0,

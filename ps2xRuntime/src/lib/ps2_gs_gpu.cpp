@@ -11,11 +11,426 @@
 #include "runtime/ps2_diag.h"
 #include <atomic>
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+
+// One process-wide monotonic epoch shared by GsDump's optional capture-time
+// window, so timestamps are directly comparable regardless of call site.
+static uint64_t dq8ProbeNowMs()
+{
+    static const auto s_epoch = std::chrono::steady_clock::now();
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - s_epoch)
+            .count());
+}
+
+// ---------------------------------------------------------------------------
+// GsDump (PS2X_GS_DUMP): raw GIF path traffic capture in a PCSX2
+// GSdump-compatible on-disk format. See ps2_gs_gpu.h for the call surface.
+//
+// Format (deduced from the offline parser that already reads PCSX2 oracle
+// .gs captures, gsparse2.py, against a known-good DQ8 dump with serial
+// SLUS-21207 / crc 0xf4715852 that parses with zero bytes left over):
+//
+//   offset 0   u32  unused control word (parser never reads it)
+//   offset 4   u32  "extra": byte length of the region starting at offset 8
+//                   that the parser skips whole
+//   offset 8   u32  hdr[0]  format/version tag
+//   offset 12  u32  hdr[1]  size of a second skip region right after the
+//                           "extra" region (VU1/VRAM freeze blob upstream;
+//                           we emit none, so this is 0)
+//   offset 16  u32  hdr[2]  size of this 9-field hdr array itself (36)
+//   offset 20  u32  hdr[3]  serial string length
+//   offset 24  u32  hdr[4]  crc
+//   offset 28  u32  hdr[5]  presentation width
+//   offset 32  u32  hdr[6]  presentation height
+//   offset 36  u32  hdr[7]  size of (hdr array + serial string) = 36 + hdr[3]
+//   offset 40  u32  hdr[8]  size of an upstream freeze-data blob; 0 here
+//   offset 44  ...  serial string, hdr[3] bytes, no terminator
+//   then       ...  hdr[8] bytes of freeze data (none, since hdr[8] == 0)
+//   then       ...  hdr[1] bytes of the second skip region (none, since
+//                   hdr[1] == 0)
+//   then       8192 bytes: initial GS privileged-register snapshot; its
+//                   CONTENT is never read by any offline tool downstream of
+//                   the parser (only the offline scripts' xfers list
+//                   matters), so we zero-fill it -- only the byte COUNT is
+//                   load-bearing for the parser's fixed-offset framing.
+//   then: packet stream to EOF, each packet self-delimiting:
+//     u8 type
+//       0 = Transfer: u8 path, u32 size (LE), then `size` raw bytes -- the
+//           GIFtag + payload exactly as submitted to the GIF unit.
+//       1 = VSync:    1 byte payload (not emitted by this writer)
+//       2 = ReadFIFO2: 4 byte payload (not emitted by this writer)
+//       3 = Registers: fixed-size 8192-byte snapshot (not emitted by this
+//           writer)
+//
+// This writer only ever emits type-0 Transfer packets. That is a strict
+// subset of the real format and round-trips through the same parser with
+// zero bytes left over.
+//
+// Throughput: the original writer called flush() after every single
+// writeTransfer(), which is a syscall-per-packet and measured slow enough
+// that a pad-input script's timed gates missed their windows. Fixed two
+// ways, both below:
+//   1. Buffering: a large filebuf (pubsetbuf, see kStreamBufferBytes) plus
+//      an explicit flush policy (kFlushByteThreshold / kFlushIntervalMs)
+//      checked only right after a whole packet has been written, so a
+//      killed process still always leaves the file ending on a complete
+//      packet boundary -- it can lose at most one flush interval's worth
+//      of tail packets, never a torn one.
+//   2. Path filter (PS2X_GS_DUMP_PATHS, env-gated, default = capture every
+//      path so behaviour is unchanged unless set).
+//
+// `dumpPathByte` follows PCSX2's own on-disk GIF_PATH numbering, NOT this
+// runtime's internal GifPathId enum (Path1=1/Path2=2/Path3=3 here, vs
+// PCSX2's Path1=0/Path2=1/Path3=2/Path1New=3): the real oracle capture for
+// DQ8 tags 100% of its VU1 XGKICK traffic as path byte 3 ("Path1New"), so
+// callers must translate before calling writeTransfer -- see the mapping
+// helper next to the GifArbiter::drain() call site in ps2_gif_arbiter.cpp.
+namespace GsDump
+{
+    namespace
+    {
+        // Large filebuf attached via pubsetbuf() before open(), so the many
+        // small writeTransfer() calls coalesce into few underlying write()
+        // syscalls instead of one per packet.
+        constexpr size_t kStreamBufferBytes = 4u * 1024u * 1024u; // 4 MiB
+
+        // Explicit flush policy on top of the large filebuf. Checked only
+        // right after a whole packet has already been written, never
+        // mid-packet, so the on-disk file always ends on a complete packet
+        // boundary even if the process is killed between flushes.
+        constexpr uint64_t kFlushByteThreshold = 4u * 1024u * 1024u; // 4 MiB
+        constexpr uint64_t kFlushIntervalMs = 2000u;                  // 2 s
+
+        const char *dumpPathName(uint8_t b)
+        {
+            switch (b)
+            {
+            case 0: return "Path1";
+            case 1: return "Path2";
+            case 2: return "Path3";
+            case 3: return "Path1New";
+            default: return "Unknown";
+            }
+        }
+
+        // Parses PS2X_GS_DUMP_PATHS: a comma/whitespace separated list of
+        // on-disk GIF path bytes (0=Path1,1=Path2,2=Path3,3=Path1New) to
+        // KEEP; every other byte is dropped before its packet is ever
+        // built. Unset or empty -> returns false and leaves `allowed`
+        // untouched (caller defaults it to all-true, i.e. unchanged legacy
+        // "capture everything" behaviour). Out-of-range tokens are ignored.
+        bool parsePathFilterEnv(bool (&allowed)[4])
+        {
+            const char *raw = std::getenv("PS2X_GS_DUMP_PATHS");
+            if (!raw || !raw[0])
+                return false;
+
+            for (int i = 0; i < 4; ++i)
+                allowed[i] = false;
+
+            const char *p = raw;
+            while (*p)
+            {
+                while (*p && !std::isdigit(static_cast<unsigned char>(*p)))
+                    ++p;
+                if (!*p)
+                    break;
+                char *end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (v >= 0 && v < 4)
+                    allowed[static_cast<size_t>(v)] = true;
+                p = (end != p) ? end : p + 1;
+            }
+            return true;
+        }
+
+        // Optional capture time window: PS2X_GS_DUMP_START_MS /
+        // PS2X_GS_DUMP_END_MS, same monotonic epoch as dq8ProbeNowMs(), so a
+        // capture can be scoped to e.g. the post-EOF FIELD window instead of
+        // the whole run. Either bound may be set alone. Unset = no gating
+        // (default, whole run captured).
+        bool parseWindowEnv(int64_t &startMs, int64_t &endMs)
+        {
+            const char *s = std::getenv("PS2X_GS_DUMP_START_MS");
+            const char *e = std::getenv("PS2X_GS_DUMP_END_MS");
+            startMs = (s && s[0]) ? static_cast<int64_t>(std::strtoll(s, nullptr, 10)) : -1;
+            endMs = (e && e[0]) ? static_cast<int64_t>(std::strtoll(e, nullptr, 10)) : -1;
+            return (startMs >= 0) || (endMs >= 0);
+        }
+
+        struct State
+        {
+            std::mutex mutex;
+            std::ofstream file;
+            std::atomic<uint64_t> transfersWritten{0};
+            std::atomic<uint64_t> bytesWritten{0};
+
+            // Backing store for the ofstream's filebuf (see kStreamBufferBytes).
+            std::vector<char> streamBuf = std::vector<char>(kStreamBufferBytes);
+            uint64_t bytesSinceFlush = 0;
+            uint64_t lastFlushMs = 0;
+
+            // Path filter (PS2X_GS_DUMP_PATHS). Indexed by on-disk path
+            // byte (0=Path1,1=Path2,2=Path3,3=Path1New).
+            bool filterActive = false;
+            bool pathAllowed[4] = {true, true, true, true};
+            uint64_t keptByPath[4] = {0, 0, 0, 0};
+            uint64_t droppedByPath[4] = {0, 0, 0, 0};
+
+            // Optional time window (PS2X_GS_DUMP_START_MS/_END_MS).
+            bool windowActive = false;
+            int64_t windowStartMs = -1;
+            int64_t windowEndMs = -1;
+            uint64_t windowDropped = 0;
+        };
+
+        State &state()
+        {
+            static State s;
+            return s;
+        }
+
+        void putU32(std::ofstream &f, uint32_t v)
+        {
+            f.write(reinterpret_cast<const char *>(&v), sizeof(v));
+        }
+
+        // Caller holds state().mutex and has already verified state().file
+        // is open.
+        void writeHeaderLocked(std::ofstream &f)
+        {
+            static const char kSerial[10] = {'S', 'L', 'U', 'S', '-', '2', '1', '2', '0', '7'};
+            static const uint32_t kSerialLen = static_cast<uint32_t>(sizeof(kSerial));
+            static const uint32_t kHdrBytes = 9u * sizeof(uint32_t);
+            static const uint32_t kCrc = 0xF4715852u; // DQ8 SLUS-21207
+            static const uint32_t kWidth = 640u;
+            static const uint32_t kHeight = 480u;
+
+            putU32(f, 0xFFFFFFFFu);              // offset 0: unused control word
+            putU32(f, kHdrBytes + kSerialLen);    // offset 4: "extra"
+            putU32(f, 9u);                        // hdr[0]: format/version tag
+            putU32(f, 0u);                        // hdr[1]: 2nd skip region size (none)
+            putU32(f, kHdrBytes);                 // hdr[2]: size of this hdr array
+            putU32(f, kSerialLen);                // hdr[3]: serial length
+            putU32(f, kCrc);                       // hdr[4]: crc
+            putU32(f, kWidth);                     // hdr[5]: width
+            putU32(f, kHeight);                    // hdr[6]: height
+            putU32(f, kHdrBytes + kSerialLen);    // hdr[7]: hdr + serial size
+            putU32(f, 0u);                         // hdr[8]: freeze-data size (none)
+            f.write(kSerial, sizeof(kSerial));
+            static const std::vector<char> kRegPad(8192, 0);
+            f.write(kRegPad.data(), static_cast<std::streamsize>(kRegPad.size()));
+        }
+
+        void shutdownLocked(State &s)
+        {
+            if (s.file.is_open())
+            {
+                s.file.flush();
+                s.file.close();
+                std::cerr << "[gsdump] closed: "
+                          << s.transfersWritten.load(std::memory_order_relaxed) << " transfers, "
+                          << s.bytesWritten.load(std::memory_order_relaxed) << " bytes"
+                          << std::endl;
+
+                // Announce filtering explicitly either way -- a reader must
+                // never be able to mistake a filtered file for a complete
+                // one just because this line was silent.
+                if (s.filterActive)
+                {
+                    std::cerr << "[gsdump] FILTERED CAPTURE (PS2X_GS_DUMP_PATHS was set): "
+                              << "this file does NOT contain every GIF path transferred this run"
+                              << std::endl;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        std::cerr << "[gsdump]   " << dumpPathName(static_cast<uint8_t>(i))
+                                  << " (byte" << i << "): kept=" << s.keptByPath[i]
+                                  << " dropped=" << s.droppedByPath[i]
+                                  << (s.pathAllowed[i] ? " [captured]" : " [excluded]")
+                                  << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cerr << "[gsdump] no path filter (PS2X_GS_DUMP_PATHS unset): "
+                              << "all GIF paths captured" << std::endl;
+                }
+
+                if (s.windowActive)
+                {
+                    std::cerr << "[gsdump] time window active: [" << s.windowStartMs << ", "
+                              << s.windowEndMs << "] ms since process start; "
+                              << s.windowDropped << " transfers dropped as outside the window"
+                              << std::endl;
+                }
+            }
+        }
+
+        extern "C" void gsDumpSignalHandler(int sig)
+        {
+            shutdown();
+            std::signal(sig, SIG_DFL);
+            std::raise(sig);
+        }
+
+        // Runs the env check + file open exactly once (C++11 magic-statics
+        // guarantee); every later call anywhere in this TU just reads the
+        // cached result. This is the single choke point for both init() and
+        // isEnabled() so the file can never be opened twice.
+        bool ensureInit()
+        {
+            static const bool enabled = []() -> bool
+            {
+                const char *path = std::getenv("PS2X_GS_DUMP");
+                if (!path || !path[0])
+                    return false;
+
+                State &s = state();
+                std::lock_guard<std::mutex> lock(s.mutex);
+
+                s.filterActive = parsePathFilterEnv(s.pathAllowed);
+                s.windowActive = parseWindowEnv(s.windowStartMs, s.windowEndMs);
+
+                // Must be attached before open() to take effect.
+                s.file.rdbuf()->pubsetbuf(s.streamBuf.data(),
+                                          static_cast<std::streamsize>(s.streamBuf.size()));
+                s.file.open(path, std::ios::binary | std::ios::trunc);
+                if (!s.file.is_open())
+                {
+                    std::cerr << "[gsdump] failed to open '" << path
+                              << "' for writing; dump disabled" << std::endl;
+                    return false;
+                }
+                writeHeaderLocked(s.file);
+                s.file.flush();
+                s.lastFlushMs = dq8ProbeNowMs();
+                std::atexit([]() { GsDump::shutdown(); });
+                std::signal(SIGINT, gsDumpSignalHandler);
+                std::signal(SIGTERM, gsDumpSignalHandler);
+                std::cout << "[gsdump] enabled, writing GIF path traffic to '" << path << "'";
+                if (s.filterActive)
+                {
+                    std::cout << " (PS2X_GS_DUMP_PATHS filter active, kept paths={";
+                    bool first = true;
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        if (!s.pathAllowed[i])
+                            continue;
+                        if (!first)
+                            std::cout << ",";
+                        std::cout << dumpPathName(static_cast<uint8_t>(i));
+                        first = false;
+                    }
+                    std::cout << "})";
+                }
+                if (s.windowActive)
+                {
+                    std::cout << " (time window [" << s.windowStartMs << ", " << s.windowEndMs
+                              << "] ms since process start)";
+                }
+                std::cout << std::endl;
+                return true;
+            }();
+            return enabled;
+        }
+    }
+
+    void init()
+    {
+        ensureInit();
+    }
+
+    bool isEnabled()
+    {
+        return ensureInit();
+    }
+
+    void writeTransfer(uint8_t dumpPathByte, const uint8_t *data, uint32_t sizeBytes)
+    {
+        if (!ensureInit())
+            return;
+        if (!data || sizeBytes == 0u)
+            return;
+
+        State &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        if (!s.file.is_open())
+            return;
+
+        // Filtering happens BEFORE the packet is built -- that is the
+        // entire point, since the whole cost of a captured-but-unwanted
+        // path was the write()+flush() this skips.
+        if (s.windowActive)
+        {
+            const int64_t now = static_cast<int64_t>(dq8ProbeNowMs());
+            const bool beforeStart = s.windowStartMs >= 0 && now < s.windowStartMs;
+            const bool afterEnd = s.windowEndMs >= 0 && now > s.windowEndMs;
+            if (beforeStart || afterEnd)
+            {
+                ++s.windowDropped;
+                return;
+            }
+        }
+        if (dumpPathByte < 4u && !s.pathAllowed[dumpPathByte])
+        {
+            ++s.droppedByPath[dumpPathByte];
+            return;
+        }
+        if (dumpPathByte < 4u)
+            ++s.keptByPath[dumpPathByte];
+
+        // Build the whole packet (type + path + size + payload) in one
+        // buffer and issue one write() call. flush() (below) is only ever
+        // called right after this write() completes, so a process killed
+        // between writeTransfer() calls always leaves a whole number of
+        // complete packets on disk, never a truncated one.
+        std::vector<char> packet;
+        packet.reserve(6u + static_cast<size_t>(sizeBytes));
+        packet.push_back(static_cast<char>(0)); // packet type 0 = Transfer
+        packet.push_back(static_cast<char>(dumpPathByte));
+        const uint32_t sz = sizeBytes;
+        const char *szBytes = reinterpret_cast<const char *>(&sz);
+        packet.insert(packet.end(), szBytes, szBytes + sizeof(sz));
+        const char *payload = reinterpret_cast<const char *>(data);
+        packet.insert(packet.end(), payload, payload + sizeBytes);
+
+        s.file.write(packet.data(), static_cast<std::streamsize>(packet.size()));
+
+        s.transfersWritten.fetch_add(1, std::memory_order_relaxed);
+        s.bytesWritten.fetch_add(sizeBytes, std::memory_order_relaxed);
+
+        // Flush on a byte/time threshold instead of every packet -- this is
+        // the throughput fix (see the namespace-level comment above). Only
+        // evaluated here, after a whole packet has already been written, so
+        // the on-disk file always ends on a packet boundary.
+        s.bytesSinceFlush += sizeBytes;
+        const uint64_t now = dq8ProbeNowMs();
+        if (s.bytesSinceFlush >= kFlushByteThreshold || (now - s.lastFlushMs) >= kFlushIntervalMs)
+        {
+            s.file.flush();
+            s.bytesSinceFlush = 0;
+            s.lastFlushMs = now;
+        }
+    }
+
+    void shutdown()
+    {
+        State &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        shutdownLocked(s);
+    }
+}
 
 namespace
 {
@@ -347,6 +762,45 @@ namespace
 
         return false;
     }
+
+    // ---- ADC / vertex-queue window (PS2X_GS_ADC_WINDOW) -------------------
+    //
+    // GS::vertexKick used to `return` immediately on a NON-drawing kick
+    // (PACKED XYZF2/XYZ2 with the ADC bit set, or an XYZF3/XYZ3 write). That
+    // skips the queue maintenance at the bottom of the function, so for the
+    // CONTINUOUS primitives (TRISTRIP/TRIFAN/LINESTRIP) the 3-entry sliding
+    // window never advances past an ADC vertex: m_vtxCount just grows, later
+    // vertices land in slots 3,4,5.. that GSRasterizer::drawTriangle never
+    // reads (it reads m_vtxQueue[0..2] unconditionally), and the next drawing
+    // kick emits a triangle built from stale vertices that straddle the
+    // strip restart. On hardware the two ADC vertices at a strip restart are
+    // exactly what flushes the previous strip out of the queue, so dropping
+    // that maintenance splices the tail of one strip onto the head of the
+    // next -- long thin triangles fanning between unrelated parts of a mesh.
+    //
+    // Gated so one binary can run both arms. OFF = historical behaviour.
+    bool adcWindowFixOn()
+    {
+        static const bool on = []()
+        {
+            const char *e = std::getenv("PS2X_GS_ADC_WINDOW");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        return on;
+    }
+
+    // Unthrottled whole-run census of vertex kicks, split by primitive type
+    // and by drawing/non-drawing, plus the count of non-drawing kicks that
+    // land while the queue is already primed (m_vtxCount >= needed) -- those
+    // are precisely the events where the historical early-return skipped
+    // required window maintenance. There is no per-event log line and no
+    // budget here, so nothing can be TRUNCATED; only the periodic summary is
+    // printed.
+    uint64_t s_vkKickDraw[8] = {0};
+    uint64_t s_vkKickSkip[8] = {0};
+    uint64_t s_vkDesync[8] = {0};
+    uint64_t s_vkDrawn[8] = {0};
+    uint64_t s_vkTotal = 0;
 
     std::atomic<uint32_t> s_debugGifPacketCount{0};
     std::atomic<uint32_t> s_debugGsRegisterCount{0};
@@ -2415,9 +2869,6 @@ void GS::vertexKick(bool drawing)
         }
     });
 
-    if (!drawing)
-        return;
-
     int needed = 0;
     switch (m_prim.type)
     {
@@ -2446,8 +2897,70 @@ void GS::vertexKick(bool drawing)
         return;
     }
 
+    // ---- census (see adcWindowFixOn above) --------------------------------
+    {
+        const uint32_t t = static_cast<uint32_t>(m_prim.type) & 7u;
+        if (drawing)
+            ++s_vkKickDraw[t];
+        else
+        {
+            ++s_vkKickSkip[t];
+            if (m_vtxCount >= needed)
+                ++s_vkDesync[t];
+        }
+        if ((++s_vkTotal % 2000000u) == 0u)
+        {
+            std::cout << "[gs:vkcensus] total=" << s_vkTotal << " adcFix="
+                      << (adcWindowFixOn() ? 1 : 0);
+            static const char *kNames[8] = {"point", "line", "linestrip", "tri",
+                                            "tristrip", "trifan", "sprite", "bad"};
+            for (uint32_t i = 0; i < 8u; ++i)
+            {
+                if ((s_vkKickDraw[i] | s_vkKickSkip[i]) == 0u)
+                    continue;
+                std::cout << ' ' << kNames[i] << "={draw=" << s_vkKickDraw[i]
+                          << ",adcskip=" << s_vkKickSkip[i]
+                          << ",desync=" << s_vkDesync[i]
+                          << ",prims=" << s_vkDrawn[i] << '}';
+            }
+            std::cout << std::endl;
+        }
+    }
+
     if (m_vtxCount < needed)
         return;
+
+    // Non-drawing kick: no primitive, but the window maintenance below still
+    // has to run (that is the whole point of an ADC vertex). Historical
+    // behaviour bailed out here instead.
+    if (!drawing && !adcWindowFixOn())
+        return;
+
+    if (!drawing)
+    {
+        switch (m_prim.type)
+        {
+        case GS_PRIM_LINESTRIP:
+            m_vtxQueue[0] = m_vtxQueue[1];
+            m_vtxCount = 1;
+            break;
+        case GS_PRIM_TRISTRIP:
+            m_vtxQueue[0] = m_vtxQueue[1];
+            m_vtxQueue[1] = m_vtxQueue[2];
+            m_vtxCount = 2;
+            break;
+        case GS_PRIM_TRIFAN:
+            m_vtxQueue[1] = m_vtxQueue[2];
+            m_vtxCount = 2;
+            break;
+        default:
+            m_vtxCount = 0;
+            break;
+        }
+        return;
+    }
+
+    ++s_vkDrawn[static_cast<uint32_t>(m_prim.type) & 7u];
 
     if (ps2_diag::enabled())
     {
