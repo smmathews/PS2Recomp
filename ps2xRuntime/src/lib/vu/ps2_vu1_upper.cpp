@@ -357,6 +357,14 @@ void VU1Interpreter::execUpper(uint32_t instr)
             return;
         case 0x1F: // CLIP
         {
+            // PCSX2 _vuCLIP: compare against |ft.w|, 6 new bits shifted into
+            // a 24-bit (3-deep) clip register. The raw shift above had no
+            // mask, so once five or more CLIP instructions had run the
+            // register grew past 24 bits and FCOR (which requires ALL 24
+            // bits set) could never see a true result again. CLIP also
+            // commits through the same 4-cycle flag pipe as MAC/STATUS
+            // (vuPipePushClip), not immediately -- FCAND/FCOR/FCEQ read
+            // m_state.clip, not the shadow.
             float w = std::fabs(vt[3]);
             uint32_t flags = 0;
             if (vs[0] > +w) flags |= 0x01;
@@ -365,7 +373,8 @@ void VU1Interpreter::execUpper(uint32_t instr)
             if (vs[1] < -w) flags |= 0x08;
             if (vs[2] > +w) flags |= 0x10;
             if (vs[2] < -w) flags |= 0x20;
-            m_state.clip = (m_state.clip << 6) | flags;
+            m_clipShadow = ((m_clipShadow << 6) | flags) & 0xFFFFFFu;
+            vuPipePushClip(m_clipShadow);
             return;
         }
         case 0x20: // ADDAq

@@ -120,6 +120,26 @@ static inline void vuLowerVfReadWriteMasks(uint32_t lower, uint32_t &readMask, u
             case 0x64: // MFP
                 vuSetRegBit(writeMask, it);
                 return;
+            // EFU block (0x70-0x7E). Every one of these reads vf[is];
+            // WAITP (0x7B) touches no VF register at all and is
+            // intentionally left out of this list -- it stalls the whole
+            // pair on P settling instead, which vuLowerIsWaitQOrP() below
+            // handles.
+            case 0x70: // ESADD
+            case 0x71: // ERSADD
+            case 0x72: // ELENG
+            case 0x73: // ERLENG
+            case 0x74: // EATANxy
+            case 0x75: // EATANxz
+            case 0x76: // ESUM
+            case 0x78: // ESQRT
+            case 0x79: // ERSQRT
+            case 0x7A: // ERCPR
+            case 0x7C: // ESIN
+            case 0x7D: // EATAN
+            case 0x7E: // EEXP
+                vuSetRegBit(readMask, is);
+                return;
             default:
                 return;
             }
@@ -140,8 +160,36 @@ static inline void vuLowerVfReadWriteMasks(uint32_t lower, uint32_t &readMask, u
     }
 }
 
+// WAITQ (lower special 0x3B) and WAITP (0x7B) touch no VF register at all,
+// so vuLowerVfReadWriteMasks() correctly reports 0/0 for both and the
+// write-overlap predicate below can never fire for them. But hardware
+// stalls the WHOLE pair until Q/P settles -- a Q-consuming upper op (e.g.
+// MULq) paired with WAITQ against a pending DIV/SQRT/RSQRT latency must see
+// the value WAITQ forces, not whatever is still sitting in st.q. Running
+// upper before lower (the default order) lets the upper read the stale
+// value and only lets WAITQ force the settle immediately after.
+//
+// Hoisting WAITQ/WAITP ahead of the upper is always safe regardless of
+// what the upper reads or writes: they have no VF side effect for the
+// double-hazard snapshot/restore in run() to get wrong, so it degrades to
+// "just run the lower first" -- which is exactly the ordering hardware's
+// whole-pair stall requires.
+static inline bool vuLowerIsWaitQOrP(uint32_t lower)
+{
+    if ((lower & 0x80000000u) == 0u)
+        return false;
+    const uint8_t funct = lower & 0x3Fu;
+    if (funct < 0x3Cu || funct > 0x3Fu)
+        return false;
+    const uint8_t specialOp = static_cast<uint8_t>((lower & 0x3u) | ((lower >> 4) & 0x7Cu));
+    return specialOp == 0x3Bu || specialOp == 0x7Bu; // WAITQ, WAITP
+}
+
 static inline bool vuLowerShouldRunBeforeUpper(uint32_t upper, uint32_t lower)
 {
+    if (vuLowerIsWaitQOrP(lower))
+        return true;
+
     const uint8_t upperWrite = vuUpperVfWriteReg(upper);
     if (upperWrite == 0u)
         return false;

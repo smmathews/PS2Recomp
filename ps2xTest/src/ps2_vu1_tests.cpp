@@ -555,5 +555,103 @@ void register_ps2_vu1_tests()
             }
             t.IsTrue(imageOk, "MSCAL-triggered XGKICK should route PATH1 packet into GS VRAM");
         });
+
+        tc.Run("FMAC writes MAC through the flag pipe, FMAND observes it once settled", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // pc0: SUB.xyz vf3, vf1, vf0 (vf0 is always (0,0,0,1) by the VF0
+            // invariant). vf1 = {-2, 0, 2, *} makes x negative-nonzero (S),
+            // y exactly zero (Z), z positive-nonzero (no flag); w is excluded
+            // from dest so its (vf1.w - 1.0) value doesn't matter.
+            writeVuInstructionPair(fx.code, 0u, 0u, makeVuUpper(0x2Cu, 0xEu, 0u, 1u, 3u));
+            // pc8/16/24/32: NOP/NOP -- just lets 4 VU cycles elapse so the
+            // flag-pipe entry (due 4 cycles after the SUB) actually commits
+            // into m_state.mac before the FMAND below reads it.
+            writeVuInstructionPair(fx.code, 8u, 0u, 0u);
+            writeVuInstructionPair(fx.code, 16u, 0u, 0u);
+            writeVuInstructionPair(fx.code, 24u, 0u, 0u);
+            writeVuInstructionPair(fx.code, 32u, 0u, 0u);
+            // pc40: FMAND vi1, vi2 (opHi 0x18, it=1, is=2).
+            const uint32_t fmand = (0x18u << 25) | (1u << 16) | (2u << 11);
+            writeVuInstructionPair(fx.code, 40u, fmand, 0u);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = -2.0f;
+            vu1.state().vf[1][1] = 0.0f;
+            vu1.state().vf[1][2] = 2.0f;
+            vu1.state().vi[2] = static_cast<int16_t>(0xFFFF); // all-ones mask
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 6u);
+
+            // x: negative, nonzero -> S bit (mac bit 4+3=7 -> 0x80).
+            // y: exactly zero      -> Z bit (mac bit 2      -> 0x04).
+            // z: positive, nonzero -> no flag.
+            t.Equals(vu1.state().mac, 0x84u, "MAC should record S on x and Z on y after the pipe settles");
+            t.Equals(vu1.state().vi[1], static_cast<int32_t>(0x84), "FMAND should read the settled MAC value");
+        });
+
+        tc.Run("CLIP accumulates through the flag pipe and masks to 24 bits", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // CLIP (upper special 0x1F): low 11 bits fixed to 0x1FF, fs at
+            // bits 15:11, ft at bits 20:16. vt is vf0 so vt.w (the clip
+            // bound) is always 1.0. vf1 = {2, 0, 2, *} exceeds +w on x and z
+            // but not y, giving flags 0x01|0x10 = 0x11 every round.
+            auto makeVuClip = [](uint8_t fs, uint8_t ft) -> uint32_t
+            {
+                return (static_cast<uint32_t>(ft & 0x1Fu) << 16) |
+                       (static_cast<uint32_t>(fs & 0x1Fu) << 11) |
+                       0x1FFu;
+            };
+            const uint32_t clip = makeVuClip(1u, 0u);
+            for (uint32_t i = 0; i < 5u; ++i)
+            {
+                writeVuInstructionPair(fx.code, i * 8u, 0u, clip);
+            }
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = 2.0f;
+            vu1.state().vf[1][1] = 0.0f;
+            vu1.state().vf[1][2] = 2.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 5u);
+
+            // Unmasked, 5 rounds of ((shadow << 6) | 0x11) overflows 24 bits
+            // (it would be 0x11451451); masked to 24 bits each round it is
+            // 0x451451. run()'s end-of-microprogram vuPipeFlushAll() forces
+            // the last round's pipe entry visible before execute() returns.
+            t.Equals(vu1.state().clip, 0x451451u, "CLIP should mask its shift register to 24 bits");
+        });
+
+        tc.Run("WAITQ is hoisted ahead of its paired Q-consuming upper op", [](TestCase &t)
+        {
+            Vu1Fixture fx;
+            t.IsTrue(fx.initialize(), "VU1 fixture should initialize");
+
+            // pc0: DIV Q, vf1.x, vf2.x = 6/2 = 3.0. DIV takes 7 cycles to
+            // settle, so Q is still the reset() default (1.0) one pair later.
+            writeVuInstructionPair(fx.code, 0u, makeVuDiv(1u, 2u, 0u, 0u), 0u);
+            // pc8: WAITQ (lower) paired with MULq.x vf3, vf1 (upper), which
+            // reads Q. Without hoisting WAITQ ahead of the upper, the upper
+            // runs first and reads the still-pending Q (1.0), giving 6.0.
+            // With the hoist, WAITQ fast-forwards the pipe to Q's due cycle
+            // first, so the upper reads the settled quotient (3.0), giving 18.0.
+            const uint32_t waitq = makeVuLowerSpecial(0x3Bu, 0u);
+            const uint32_t mulq = makeVuUpper(0x1Cu, 0x8u, 0u, 1u, 3u);
+            writeVuInstructionPair(fx.code, 8u, waitq, mulq);
+
+            VU1Interpreter vu1;
+            vu1.state().vf[1][0] = 6.0f;
+            vu1.state().vf[2][0] = 2.0f;
+
+            vu1.execute(fx.code, PS2_VU1_CODE_SIZE, fx.data, PS2_VU1_DATA_SIZE, fx.gs, &fx.mem, 0u, 0u, 0u, 2u);
+
+            t.Equals(vu1.state().vf[3][0], 18.0f,
+                      "WAITQ's pair should observe the settled DIV quotient, not the stale pre-DIV Q");
+        });
     });
 }

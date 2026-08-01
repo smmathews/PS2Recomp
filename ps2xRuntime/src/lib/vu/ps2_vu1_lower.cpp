@@ -552,17 +552,22 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 int ftf = (instr >> 23) & 0x3;
                 float num = m_state.vf[vfS][fsf];
                 float den = m_state.vf[vfT][ftf];
+                float qv;
                 if (den != 0.0f)
-                    m_state.q = num / den;
+                    qv = num / den;
                 else
-                    m_state.q = (num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+                    qv = (num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max();
+                // DIV takes 7 cycles to settle (PCSX2 _vuFDIVAdd); WAITQ
+                // forces the wait instead of this instruction's own pair
+                // observing the fresh quotient a full iteration early.
+                vuPipeStartQ(qv, 7u);
                 return;
             }
             case 0x39: // SQRT
             {
                 int ftf = (instr >> 23) & 0x3;
                 float val = m_state.vf[vfT][ftf];
-                m_state.q = std::sqrt(std::fabs(val));
+                vuPipeStartQ(std::sqrt(std::fabs(val)), 7u);
                 return;
             }
             case 0x3A: // RSQRT
@@ -571,13 +576,16 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 int ftf = (instr >> 23) & 0x3;
                 float num = m_state.vf[vfS][fsf];
                 float den = std::sqrt(std::fabs(m_state.vf[vfT][ftf]));
+                float qv;
                 if (den != 0.0f)
-                    m_state.q = num / den;
+                    qv = num / den;
                 else
-                    m_state.q = std::numeric_limits<float>::max();
+                    qv = std::numeric_limits<float>::max();
+                vuPipeStartQ(qv, 13u);
                 return;
             }
             case 0x3B: // WAITQ
+                vuPipeWaitQ();
                 return;
             case 0x3C: // MTIR (Move To Integer Register)
             {
@@ -683,24 +691,25 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             case 0x72: // ELENG
             {
                 float s = m_state.vf[vfS][0] * m_state.vf[vfS][0] + m_state.vf[vfS][1] * m_state.vf[vfS][1] + m_state.vf[vfS][2] * m_state.vf[vfS][2];
-                m_state.p = std::sqrt(s);
+                vuPipeStartP(std::sqrt(s), 18u);
                 return;
             }
             case 0x73: // ERLENG
             {
                 float s = m_state.vf[vfS][0] * m_state.vf[vfS][0] + m_state.vf[vfS][1] * m_state.vf[vfS][1] + m_state.vf[vfS][2] * m_state.vf[vfS][2];
                 float len = std::sqrt(s);
-                m_state.p = (len != 0.0f) ? (1.0f / len) : std::numeric_limits<float>::max();
+                vuPipeStartP((len != 0.0f) ? (1.0f / len) : std::numeric_limits<float>::max(), 24u);
                 return;
             }
             case 0x7A: // ERCPR
             {
                 int fsf = (instr >> 21) & 0x3;
                 float val = m_state.vf[vfS][fsf];
-                m_state.p = (val != 0.0f) ? (1.0f / val) : std::numeric_limits<float>::max();
+                vuPipeStartP((val != 0.0f) ? (1.0f / val) : std::numeric_limits<float>::max(), 12u);
                 return;
             }
             case 0x7B: // WAITP
+                vuPipeWaitP();
                 return;
             case 0x7D: // EATAN / EATANxy / EATANxz placeholder
                 return;

@@ -1401,6 +1401,12 @@ void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint3
 
     m_vu0.reset();
     copyVu0ContextToState(ctx, m_vu0.state());
+    // reset()'s vuPipeReset() ran BEFORE the copy above populated
+    // mac/clip/status from ctx, so it seeded the flag-pipe shadow (read by
+    // FMAND/FMEQ/FMOR/...) from a still-zeroed state. Reseed now that the
+    // real entry flags are in place, so shadow and architectural state
+    // agree from cycle 0.
+    m_vu0.resyncPipelineShadow();
     m_vu0.execute(vu0Code, PS2_VU0_CODE_SIZE,
                   vu0Data, PS2_VU0_DATA_SIZE,
                   m_gs, &m_memory,
