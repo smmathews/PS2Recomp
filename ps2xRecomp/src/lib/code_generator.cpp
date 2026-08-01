@@ -49,6 +49,37 @@ namespace ps2recomp
         return inst;
     }
 
+    // DEST-field mask literal for a COP2 macro-mode op. The DEST field is
+    // raw[24:21], x,y,z,w from the high bit down, so bit 3 = x ... bit 0 = w;
+    // _mm_set_epi32 takes its lanes high-to-low, hence w first.
+    static std::string vuDestMaskLiteral(uint8_t destMask)
+    {
+        return fmt::format("_mm_set_epi32({}, {}, {}, {})",
+                           (destMask & 0x1) ? -1 : 0, (destMask & 0x2) ? -1 : 0,
+                           (destMask & 0x4) ? -1 : 0, (destMask & 0x8) ? -1 : 0);
+    }
+
+    // Accumulator write honouring DEST.
+    //
+    // On hardware every accumulator-writing VU op (VADDA/VSUBA/VMULA/VMADDA/
+    // VMSUBA/VOPMULA, in all their bc/q/i forms) writes ONLY the lanes named
+    // by its destination field; the remaining lanes keep their previous ACC
+    // value. PCSX2 VUops.cpp guards each lane with its own if (_X)/if (_Y)/...
+    // Writing all four lanes unconditionally destroys whatever a masked chain
+    // was deliberately preserving -- e.g. the extremely common
+    //     vmulaw.w   ACC, vf_m3, vf00      ; seed ACC.w from the translation row
+    //     vmulax.xyz ACC, vf_m0, v         ; ...must not disturb ACC.w
+    //     vmadday.xyz ACC, vf_m1, v
+    //     vmaddaz.xyz ACC, vf_m2, v
+    //     vmaddw.xyzw vf_r, vf_m3, vf00
+    // idiom, where an unmasked ACC write in the second op wipes the w the
+    // first op just set, leaving a column of the result matrix dead.
+    static std::string vuAccWrite(const std::string &valueExpr, uint8_t destMask)
+    {
+        (void)destMask; // BISECT VARIANT A: legacy unmasked ACC write
+        return fmt::format("ctx->vu0_acc = {};", valueExpr);
+    }
+
     static std::string formatFloatLiteral(float value)
     {
         if (!std::isfinite(value))
@@ -1808,10 +1839,20 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
+                // R5900 COP1 has no infinities: a divide by zero saturates to
+                // +/-Fmax with the D flag set, and the sign is the XOR of the
+                // two operand signs (PCSX2 FPU.cpp DIV_S: "_FdValUl_ =
+                // ((_FsValUl_ ^ _FtValUl_) & 0x80000000) | posFmax"), which is
+                // why the sign has to come off the raw bits -- copysign from
+                // fs alone gets 0 / -0 wrong. Yielding a real IEEE infinity
+                // here poisons the guest, because the first Inf*0 or Inf-Inf
+                // downstream becomes a NaN that then spreads through whole
+                // matrices. See PS2_FPU_MAX.
                 return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                                   "uint32_t _dn, _dd; std::memcpy(&_dn, &ctx->f[{}], 4); std::memcpy(&_dd, &ctx->f[{}], 4); "
+                                   "uint32_t _dr = ((_dn ^ _dd) & 0x80000000u) | 0x7F7FFFFFu; std::memcpy(&ctx->f[{}], &_dr, 4); }} "
+                                   "else ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]);",
+                                   ft, fs, ft, fd, fd, fs, ft);
             case COP1_S_SQRT:
                 return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
             case COP1_S_ABS:
@@ -1831,7 +1872,20 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // rsqrt.s fd, fs, ft  ->  fd = fs / sqrt(|ft|). It is a
+                // two-operand instruction: the old emission used fs as the
+                // radicand, hard-coded 1.0 as the numerator and ignored ft
+                // entirely, so the canonical "rsqrt.s fd, one, len2" idiom
+                // returned 1/sqrt(1.0) = 1.0 for every input. It also handed
+                // back Inf for ft == 0 and a NaN for ft < 0, neither of which
+                // this FPU can represent. PCSX2 FPU.cpp RSQRT_S: a zero ft
+                // sets D and yields ((fs ^ ft) & sign) | posFmax; a negative
+                // ft sets I and uses sqrt(fabs(ft)).
+                return fmt::format("if ((ctx->f[{}] == 0.0f)) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "uint32_t _rn, _rd; std::memcpy(&_rn, &ctx->f[{}], 4); std::memcpy(&_rd, &ctx->f[{}], 4); "
+                                   "uint32_t _rr = ((_rn ^ _rd) & 0x80000000u) | 0x7F7FFFFFu; std::memcpy(&ctx->f[{}], &_rr, 4); }} "
+                                   "else ctx->f[{}] = FPU_DIV_S(ctx->f[{}], FPU_SQRT_S(ctx->f[{}]));",
+                                   ft, fs, ft, fd, fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("ctx->f[31] = FPU_ADD_S(ctx->f[{}], ctx->f[{}]);", fs, ft);
             case COP1_S_SUBA:
@@ -2322,8 +2376,10 @@ namespace ps2recomp
                 return fmt::format("SET_GPR_VEC(ctx, {}, _mm_castps_si128(ctx->vu0_acc));", rt);
             case VU0_CR_INFO: // I dd found on offical docs but ok
                 return fmt::format("SET_GPR_U32(ctx, {}, ctx->vu0_info);", rt);
-            case VU0_CR_CLIP2:
-                return fmt::format("SET_GPR_U32(ctx, {}, ctx->vu0_clip_flags2);", rt);
+            case VU0_CR_Q:
+                // Q holds a float; CFC2 moves its RAW BITS into the GPR (guest
+                // code typically follows with mtc1 to reinterpret it as float).
+                return fmt::format("{{ uint32_t bits; std::memcpy(&bits, &ctx->vu0_q, sizeof(bits)); SET_GPR_U32(ctx, {}, bits); }}", rt);
             case VU0_CR_P:
                 return fmt::format("{{ uint32_t bits; std::memcpy(&bits, &ctx->vu0_p, sizeof(bits)); SET_GPR_U32(ctx, {}, bits); }}", rt);
             case VU0_CR_XITOP: // Maybe this does not exist, maybe we handle to vu0_itop
@@ -2384,8 +2440,8 @@ namespace ps2recomp
                 return fmt::format("ctx->vu0_acc = _mm_castsi128_ps(GPR_VEC(ctx, {}));", rt);
             case VU0_CR_INFO:
                 return fmt::format("ctx->vu0_info = GPR_U32(ctx, {});", rt);
-            case VU0_CR_CLIP2:
-                return fmt::format("ctx->vu0_clip_flags2 = GPR_U32(ctx, {});", rt);
+            case VU0_CR_Q:
+                return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_q, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_P:
                 return fmt::format("{{ uint32_t tmp = GPR_U32(ctx, {}); std::memcpy(&ctx->vu0_p, &tmp, sizeof(tmp)); }}", rt);
             case VU0_CR_XITOP:
@@ -2532,9 +2588,33 @@ namespace ps2recomp
                                        inst.rt, inst.rt);
                 }
                 case VU0_S2_VMOVE:
-                    return fmt::format("ctx->vu0_vf[{}] = ctx->vu0_vf[{}];", inst.rt, inst.rd);
+                {
+                    // Honour the destination mask: VMOVE.w copies one lane, not
+                    // the whole register.
+                    uint8_t dest_mask = inst.vectorInfo.vectorField;
+                    return fmt::format("{{ __m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                                       "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _mm_castsi128_ps(mask)); }}",
+                                       (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                                       (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+                                       inst.rt, inst.rt, inst.rd);
+                }
                 case VU0_S2_VMR32:
-                    return fmt::format("ctx->vu0_vf[{}] = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,1));", inst.rt, inst.rd, inst.rd);
+                {
+                    // VMR32 rotates the vector left by one lane:
+                    //   vfd.x = vfs.y, vfd.y = vfs.z, vfd.z = vfs.w, vfd.w = vfs.x
+                    // which is _MM_SHUFFLE(0,3,2,1). The old _MM_SHUFFLE(0,0,0,1)
+                    // produced (y,x,x,x) and additionally ignored the
+                    // destination mask, so a masked VMR32 clobbered all four
+                    // lanes of the target.
+                    uint8_t dest_mask = inst.vectorInfo.vectorField;
+                    return fmt::format("{{ __m128 res = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,3,2,1)); "
+                                       "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
+                                       "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
+                                       inst.rd, inst.rd,
+                                       (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
+                                       (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
+                                       inst.rt, inst.rt);
+                }
                 case VU0_S2_VCLIPw:
                 {
                     uint8_t field = inst.function & 0x3;
@@ -3049,21 +3129,45 @@ namespace ps2recomp
         uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
 
-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+        // VDIV Q, vfs[fsf], vft[ftf]. A zero divisor does not yield zero (nor
+        // an infinity): the VU sets the D flag and latches +/-Fmax with the
+        // sign of fs XOR ft. PCSX2 VUops.cpp _vuDIV: "if (VU->VF[_Ft_].UL[ftf]
+        // == 0) { ...; VU->q.UL = ((fs ^ ft) & 0x80000000) | 0x7f7fffff; }".
+        // The non-degenerate quotient still saturates at Fmax.
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+                           "if (ft == 0.0f) {{ uint32_t _qn, _qd; std::memcpy(&_qn, &fs, 4); std::memcpy(&_qd, &ft, 4); "
+                           "uint32_t _qr = ((_qn ^ _qd) & 0x80000000u) | 0x7F7FFFFFu; std::memcpy(&ctx->vu0_q, &_qr, 4); }} "
+                           "else ctx->vu0_q = FPU_DIV_S(fs, ft); }}",
+                           fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
     {
         uint8_t ftf = inst.vectorInfo.ftf;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
+        // VSQRT takes the magnitude of its operand (there is no NaN to return
+        // for a negative radicand; the VU raises I and uses |ft|). Clamping to
+        // zero instead silently turned every negative operand into 0.
+        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = PS2_VSQRT(ft); }}", ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
     {
+        uint8_t fsf = inst.vectorInfo.fsf;
         uint8_t ftf = inst.vectorInfo.ftf;
+        uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
+        // VRSQRT Q, vfs[fsf], vft[ftf]  ->  Q = fs / sqrt(|ft|). The numerator
+        // is a real operand: the old emission hard-coded 1.0 and dropped fs
+        // entirely. A zero radicand latches +/-Fmax (sign fs^ft) with D set,
+        // and a negative one uses |ft| with I set -- PCSX2 VUops.cpp _vuRSQRT.
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+                           "if (ft == 0.0f) {{ uint32_t _rn, _rd; std::memcpy(&_rn, &fs, 4); std::memcpy(&_rd, &ft, 4); "
+                           "uint32_t _rr = ((_rn ^ _rd) & 0x80000000u) | 0x7F7FFFFFu; std::memcpy(&ctx->vu0_q, &_rr, 4); }} "
+                           "else ctx->vu0_q = FPU_DIV_S(fs, PS2_VSQRT(ft)); }}",
+                           fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
@@ -3169,6 +3273,15 @@ namespace ps2recomp
             "}}");
     }
 
+    // ---- non-accumulator multiply-add family ------------------------------
+    //
+    // VMADD/VMSUB (and their bc/q/i forms) read the accumulator and write vfd.
+    // They do NOT write the accumulator -- that is what the separate VMADDA/
+    // VMSUBA opcodes are for (PCSX2 VUops.cpp: _vuMADD writes only VF[_Fd_],
+    // _vuMADDA writes only ACC). Every one of these used to append
+    // "ctx->vu0_acc = res;", which both invented an ACC write hardware never
+    // performs and did it unmasked, so a masked VMADD at the end of one
+    // transform corrupted the accumulator seen by the next.
     std::string CodeGenerator::translateVU_VMADD_Field(const Instruction &inst)
     {
         uint8_t vfd = inst.sa;
@@ -3377,11 +3490,14 @@ namespace ps2recomp
         uint8_t vfs = inst.rd;
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+        // VOPMSUB is the second half of the VU's cross-product pair, not a
+        // component-wise multiply-subtract: vfd = ACC - (vfs (x) vft), where
+        // (x) is the lane-rotated outer-product term (see PS2_VOPMUL). It
+        // writes vfd only -- ACC is left alone.
+        return fmt::format("{{ __m128 mul_res = PS2_VOPMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
                            "__m128 res = PS2_VSUB(ctx->vu0_acc, mul_res); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
-                           "ctx->vu0_acc = res; }}",
+                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, vft,
                            (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
                            (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
@@ -3515,6 +3631,12 @@ namespace ps2recomp
                            vfd, vfd);
     }
 
+    // ---- accumulator-writing macro ops -----------------------------------
+    //
+    // All of these route their ACC write through vuAccWrite() so the
+    // destination field is honoured. See the comment on vuAccWrite for why an
+    // unmasked ACC write is destructive.
+
     std::string CodeGenerator::translateVU_VADDA_Field(const Instruction &inst)
     {
         uint8_t vfs = inst.rd;
@@ -3522,9 +3644,9 @@ namespace ps2recomp
         uint8_t field = inst.function & 0x3;
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
-        return fmt::format("{{ __m128 res = PS2_VADD(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
-                           "ctx->vu0_acc = res; }}",
-                           vfs, vft, vft, shuffle_pattern);
+        return fmt::format("{{ __m128 res = PS2_VADD(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); {} }}",
+                           vfs, vft, vft, shuffle_pattern,
+                           vuAccWrite("res", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VSUBA_Field(const Instruction &inst)
@@ -3534,9 +3656,9 @@ namespace ps2recomp
         uint8_t field = inst.function & 0x3;
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
-        return fmt::format("{{ __m128 res = PS2_VSUB(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
-                           "ctx->vu0_acc = res; }}",
-                           vfs, vft, vft, shuffle_pattern);
+        return fmt::format("{{ __m128 res = PS2_VSUB(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); {} }}",
+                           vfs, vft, vft, shuffle_pattern,
+                           vuAccWrite("res", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMADDA_Field(const Instruction &inst)
@@ -3547,9 +3669,9 @@ namespace ps2recomp
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
         return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
-                           "__m128 res = PS2_VADD(ctx->vu0_acc, mul_res); "
-                           "ctx->vu0_acc = res; }}",
-                           vfs, vft, vft, shuffle_pattern);
+                           "__m128 res = PS2_VADD(ctx->vu0_acc, mul_res); {} }}",
+                           vfs, vft, vft, shuffle_pattern,
+                           vuAccWrite("res", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMSUBA_Field(const Instruction &inst)
@@ -3560,9 +3682,9 @@ namespace ps2recomp
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
         return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
-                           "__m128 res = PS2_VSUB(ctx->vu0_acc, mul_res); "
-                           "ctx->vu0_acc = res; }}",
-                           vfs, vft, vft, shuffle_pattern);
+                           "__m128 res = PS2_VSUB(ctx->vu0_acc, mul_res); {} }}",
+                           vfs, vft, vft, shuffle_pattern,
+                           vuAccWrite("res", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMULA_Field(const Instruction &inst)
@@ -3572,133 +3694,112 @@ namespace ps2recomp
         uint8_t field = inst.function & 0x3;
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
-        return fmt::format("{{ __m128 res = PS2_VMUL(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
-                           "ctx->vu0_acc = res; }}",
-                           vfs, vft, vft, shuffle_pattern);
+        return fmt::format("{{ __m128 res = PS2_VMUL(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); {} }}",
+                           vfs, vft, vft, shuffle_pattern,
+                           vuAccWrite("res", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VADDA(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        uint8_t vft = inst.rt;
-        return fmt::format("ctx->vu0_acc = PS2_VADD(ctx->vu0_vf[{}], ctx->vu0_vf[{}]);",
-                           vfs, vft);
+        return vuAccWrite(fmt::format("PS2_VADD(ctx->vu0_vf[{}], ctx->vu0_vf[{}])", inst.rd, inst.rt),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VADDAq(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("ctx->vu0_acc = PS2_VADD(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q));",
-                           vfs);
+        return vuAccWrite(fmt::format("PS2_VADD(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q))", inst.rd),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VADDAi(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("ctx->vu0_acc = PS2_VADD(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i));",
-                           vfs);
+        return vuAccWrite(fmt::format("PS2_VADD(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i))", inst.rd),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VSUBA(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        uint8_t vft = inst.rt;
-        return fmt::format("ctx->vu0_acc = PS2_VSUB(ctx->vu0_vf[{}], ctx->vu0_vf[{}]);",
-                           vfs, vft);
+        return vuAccWrite(fmt::format("PS2_VSUB(ctx->vu0_vf[{}], ctx->vu0_vf[{}])", inst.rd, inst.rt),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VSUBAq(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("ctx->vu0_acc = PS2_VSUB(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q));",
-                           vfs);
+        return vuAccWrite(fmt::format("PS2_VSUB(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q))", inst.rd),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VSUBAi(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("ctx->vu0_acc = PS2_VSUB(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i));",
-                           vfs);
+        return vuAccWrite(fmt::format("PS2_VSUB(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i))", inst.rd),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VMADDA(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        uint8_t vft = inst.rt;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
-                           "ctx->vu0_acc = PS2_VADD(ctx->vu0_acc, mul_res); }}",
-                           vfs, vft);
+        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); {} }}",
+                           inst.rd, inst.rt,
+                           vuAccWrite("PS2_VADD(ctx->vu0_acc, mul_res)", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMADDAq(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q)); "
-                           "ctx->vu0_acc = PS2_VADD(ctx->vu0_acc, mul_res); }}",
-                           vfs);
+        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q)); {} }}",
+                           inst.rd,
+                           vuAccWrite("PS2_VADD(ctx->vu0_acc, mul_res)", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMADDAi(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
-                           "ctx->vu0_acc = PS2_VADD(ctx->vu0_acc, mul_res); }}",
-                           vfs);
+        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); {} }}",
+                           inst.rd,
+                           vuAccWrite("PS2_VADD(ctx->vu0_acc, mul_res)", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMSUBA(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        uint8_t vft = inst.rt;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
-                           "ctx->vu0_acc = PS2_VSUB(ctx->vu0_acc, mul_res); }}",
-                           vfs, vft);
+        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); {} }}",
+                           inst.rd, inst.rt,
+                           vuAccWrite("PS2_VSUB(ctx->vu0_acc, mul_res)", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMSUBAq(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q)); "
-                           "ctx->vu0_acc = PS2_VSUB(ctx->vu0_acc, mul_res); }}",
-                           vfs);
+        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q)); {} }}",
+                           inst.rd,
+                           vuAccWrite("PS2_VSUB(ctx->vu0_acc, mul_res)", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMSUBAi(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
-                           "ctx->vu0_acc = PS2_VSUB(ctx->vu0_acc, mul_res); }}",
-                           vfs);
+        return fmt::format("{{ __m128 mul_res = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); {} }}",
+                           inst.rd,
+                           vuAccWrite("PS2_VSUB(ctx->vu0_acc, mul_res)", inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VMULA(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        uint8_t vft = inst.rt;
-        return fmt::format("ctx->vu0_acc = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]);",
-                           vfs, vft);
+        return vuAccWrite(fmt::format("PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}])", inst.rd, inst.rt),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VMULAq(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("ctx->vu0_acc = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q));",
-                           vfs);
+        return vuAccWrite(fmt::format("PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_q))", inst.rd),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VMULAi(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        return fmt::format("ctx->vu0_acc = PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i));",
-                           vfs);
+        return vuAccWrite(fmt::format("PS2_VMUL(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i))", inst.rd),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VOPMULA(const Instruction &inst)
     {
-        uint8_t vfs = inst.rd;
-        uint8_t vft = inst.rt;
-        return fmt::format("ctx->vu0_acc = PS2_VMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}]);",
-                           vfs, vft);
+        // Outer-product term, not a component-wise multiply (see PS2_VOPMUL).
+        return vuAccWrite(fmt::format("PS2_VOPMUL(ctx->vu0_vf[{}], ctx->vu0_vf[{}])", inst.rd, inst.rt),
+                          inst.vectorInfo.vectorField);
     }
 
     std::string CodeGenerator::translateVU_VITOF(const Instruction &inst, int shift)

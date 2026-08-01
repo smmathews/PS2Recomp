@@ -696,7 +696,13 @@ namespace ps2recomp
         VU0_CR_FBRST4 = 18,    // VIF/VU reset register 4
         VU0_CR_ACC = 20,       // Accumulator register
         VU0_CR_INFO = 21,      // Information register
-        VU0_CR_CLIP2 = 22,     // Clipping flags register 2
+        // COP2 control register 22 is the Q register on real hardware, not a
+        // second clipping-flag register. Proof from shipped game code:
+        //   vsqrt $Q, $vf5x ; vwaitq ; cfc2 $v0, $vi22 ; mtc1 $v0, $f0
+        // i.e. compute a square root into Q, stall specifically for Q, then
+        // read creg 22 and return it as a float. Reading anything else there
+        // makes every vector-length helper return garbage.
+        VU0_CR_Q = 22,         // Q register (quotient / VSQRT result)
         VU0_CR_P = 26,         // P register
         VU0_CR_XITOP = 27,     // XITOP register
         VU0_CR_ITOP = 28,      // ITOP register

@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -137,6 +138,20 @@ struct alignas(16) R5900Context
         // Initialize VU0 registers
         vu0_q = 1.0f; // Q register usually initialized to 1.0
 
+        // VF0 is hardwired on real VU hardware to the constant (x,y,z,w) =
+        // (0,0,0,1) and is never writable. The memset above leaves it at
+        // (0,0,0,0); DQ8's VU0-macro-mode code reads vf0.w in matrix-inverse
+        // cofactor divides (bone-palette/skinning math), so an unpinned vf0
+        // silently collapses skinned geometry while rigid geometry -- which
+        // never reads vf0 -- looks fine. This constructor is what actually
+        // seeds every guest fiber's R5900Context (see ps2_scheduler.cpp
+        // create_fiber), so this is the pin that matters at scale; the
+        // explicit pin PS2Runtime's own constructor applies to m_cpuContext
+        // only covers the main/first context and is now redundant-but-
+        // harmless for that one context. See
+        // dq8/reference/dc2-learnings/04-vu-interpreter-correctness.md.
+        vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f); // (w,z,y,x) => x=y=z=0, w=1
+
         // Reset COP0 registers
         cop0_random = 47; // Start at maximum value
         // cop0_status = 0x400000; // BEV set, ERL clear, kernel mode
@@ -205,55 +220,152 @@ inline void setReturnU64(R5900Context *ctx, uint64_t value)
     ctx->r[3] = _mm_set_epi64x(0, static_cast<int64_t>(static_cast<uint32_t>(value >> 32)));
 }
 
+// ===========================================================================
+// Forensic write watches: STALE-INLINE HAZARD AND ITS FIX
+//
+// These probes are reached from the WRITE8/16/32/64/128 macros, so their code
+// is instantiated into every one of the ~7800 generated corpus translation
+// units. When the probe *policy* (log budget, watched address, output format)
+// lived in `inline` functions in this header, each TU baked in whatever policy
+// was current on the day it was compiled. The corpus is rebuilt rarely; the
+// runtime is rebuilt constantly. The two therefore drifted, and the corpus
+// kept enforcing a silent hard 512-event cap long after the header had grown
+// an env-tunable budget with a TRUNCATED announcement. Setting
+// PS2X_SLOT_WATCH_MAX_LOGS=0 changed nothing on the path that mattered, no
+// TRUNCATED line could ever be emitted, and three separate investigations
+// mistook a truncated boot-phase window for a complete record.
+//
+// The rule that prevents a recurrence:
+//
+//   NOTHING IN THIS HEADER MAY DECIDE ANYTHING.
+//
+//   * Policy (budgets, env parsing, watched addresses, formatting, stream
+//     choice) lives ONLY in non-inline functions defined in
+//     src/lib/ps2_runtime.cpp and linked into libps2_runtime.so. One copy
+//     exists per process, so every caller obeys one policy no matter when it
+//     was compiled. Changing policy is a 2-minute runtime rebuild.
+//
+//   * The header may hold `inline` *variables* (C++17). Those are merged by
+//     the linker to a single instance, so they cannot drift the way inlined
+//     *code* does. The armed addresses live in such variables rather than in
+//     `constexpr` constants precisely so they are re-aimable without touching
+//     any corpus TU.
+//
+//   * The only inline code left below is an address-range compare against
+//     those variables, kept inline because it runs on every guest store. It
+//     encodes no policy, so it has nothing to go stale about.
+//
+// If you add a new probe here, add a `ps2Diag*` entry point in ps2_runtime.cpp
+// and call it. Do not put a budget, an env lookup, or a format string in this
+// file.
+// ===========================================================================
+
 inline constexpr uint32_t PS2_PATH_WATCH_ADDR = 0x01EFFFA0u;
 inline constexpr uint32_t PS2_PATH_WATCH_BYTES = 0x200u;
-inline constexpr uint32_t PS2_PATH_WATCH_MAX_LOGS = 4096u;
-inline std::atomic<uint32_t> g_ps2PathWatchLogCount{0};
+inline constexpr uint32_t PS2_PATH_WATCH_MAX_LOGS_DEFAULT = 4096u;
+inline constexpr uint32_t PS2_SLOT_WATCH_MAX_LOGS_DEFAULT = 512u;
 
-inline uint32_t ps2PathWatchPhysAddr()
+// Linker-merged probe state. Exactly one instance exists per process even
+// though this header is included by thousands of TUs, so arming a probe from
+// the runner is seen identically by corpus code and runtime code.
+inline std::atomic<uint32_t> g_ps2PathWatchLogCount{0};
+inline std::atomic<bool> g_ps2PathWatchTruncated{false};
+inline std::atomic<uint32_t> g_ps2SlotWatchLogCount{0};
+inline std::atomic<bool> g_ps2SlotWatchTruncated{false};
+
+// Armed guest addresses. 0 = disarmed. Kept as variables, not constants, so
+// re-aiming a watch never requires recompiling the corpus.
+//
+// g_ps2SlotWatchAddr: single 4-byte word watch, disarmed by default; the DQ8
+// runner arms it from the DQ8_PROBE_WATCHADDR env var.
+// g_ps2PathWatchBase/Bytes: byte-range watch, armed by default at the historic
+// compile-time constants so existing behaviour is unchanged.
+inline std::atomic<uint32_t> g_ps2SlotWatchAddr{0};
+inline std::atomic<uint32_t> g_ps2PathWatchBase{PS2_PATH_WATCH_ADDR};
+inline std::atomic<uint32_t> g_ps2PathWatchBytes{PS2_PATH_WATCH_BYTES};
+
+// ---------------------------------------------------------------------------
+// Non-inline policy entry points. Defined once, in ps2_runtime.cpp.
+//
+// ps2DiagEnvLimit / ps2DiagLogBudget are the shared budget machinery: a limit
+// of 0 means unlimited, and the first dropped event announces itself once with
+// a "TRUNCATED after N events" line on the same stream as the events, so a
+// capped probe can never again be misread as a probe that saw nothing.
+// ---------------------------------------------------------------------------
+uint32_t ps2DiagEnvLimit(const char *envName, uint32_t fallback);
+
+bool ps2DiagLogBudget(std::ostream &os,
+                      const char *tag,
+                      const char *envName,
+                      uint32_t limit,
+                      uint32_t logIndex,
+                      std::atomic<bool> &truncationAnnounced);
+
+uint32_t ps2PathWatchMaxLogs();
+uint32_t ps2SlotWatchMaxLogs();
+
+// Physical (RAM-masked) base of the armed path watch, and its length in bytes.
+// Resolved here rather than from a constant so callers outside this header
+// cannot disagree with it.
+uint32_t ps2PathWatchPhysAddr();
+uint32_t ps2PathWatchWatchBytes();
+
+// Emits one report line. Callers have already established that the write
+// intersects the armed range; everything else is decided in here.
+void ps2DiagSlotWatchReport(uint32_t writeAddr,
+                            uint32_t size,
+                            uint64_t valueLo,
+                            uint64_t valueHi,
+                            const char *op,
+                            const R5900Context *ctx);
+
+void ps2DiagPathWatchReport(const uint8_t *rdram,
+                            uint32_t writeAddr,
+                            uint32_t size,
+                            uint64_t valueLo,
+                            uint64_t valueHi,
+                            const char *op,
+                            const R5900Context *ctx);
+
+void ps2DiagPathRangeReport(const uint8_t *rdram,
+                            uint32_t writeAddr,
+                            uint32_t size,
+                            const char *op,
+                            const R5900Context *ctx);
+
+// Announces the armed/disarmed state of every probe in this header on stderr.
+// Called once during runtime startup so a run's log always records what was
+// being measured, rather than leaving an absence of events ambiguous.
+void ps2DiagAnnounceWatchState();
+
+// ---------------------------------------------------------------------------
+// Inline hot-path gates. Address arithmetic only, no policy. Called on every
+// guest store, which is why these stay inline; they must remain trivial.
+// ---------------------------------------------------------------------------
+inline bool ps2SlotWatchIntersects(uint32_t writeAddr, uint32_t writeSize)
 {
-    return PS2_PATH_WATCH_ADDR & PS2_RAM_MASK;
+    const uint32_t watch = g_ps2SlotWatchAddr.load(std::memory_order_relaxed);
+    if (watch == 0u)
+    {
+        return false;
+    }
+    const uint32_t watchPhys = watch & PS2_RAM_MASK;
+    const uint64_t writeStart = writeAddr;
+    const uint64_t writeEnd = writeStart + static_cast<uint64_t>(writeSize);
+    return writeEnd > watchPhys && writeStart < static_cast<uint64_t>(watchPhys) + 4u;
 }
 
 inline bool ps2PathWatchIntersects(uint32_t writeAddr, uint32_t writeSize)
 {
+    const uint32_t bytes = g_ps2PathWatchBytes.load(std::memory_order_relaxed);
+    if (bytes == 0u)
+    {
+        return false;
+    }
+    const uint64_t watchStart = g_ps2PathWatchBase.load(std::memory_order_relaxed) & PS2_RAM_MASK;
     const uint64_t writeStart = writeAddr;
     const uint64_t writeEnd = writeStart + static_cast<uint64_t>(writeSize);
-    const uint64_t watchStart = ps2PathWatchPhysAddr();
-    const uint64_t watchEnd = watchStart + static_cast<uint64_t>(PS2_PATH_WATCH_BYTES);
-    return writeEnd > watchStart && writeStart < watchEnd;
-}
-
-inline void ps2PathWatchDumpPrefix(const uint8_t *rdram)
-{
-    if (!rdram)
-    {
-        return;
-    }
-
-    const uint32_t base = ps2PathWatchPhysAddr();
-    auto flags = std::cout.flags();
-    std::cout << " buf=" << std::hex;
-    for (uint32_t i = 0; i < 16u; ++i)
-    {
-        const uint32_t addr = (base + i) & PS2_RAM_MASK;
-        std::cout << static_cast<uint32_t>(rdram[addr]);
-        if (i + 1u < 16u)
-        {
-            std::cout << '.';
-        }
-    }
-    std::cout.flags(flags);
-}
-
-inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t watchAddr, uint64_t valueLo, uint64_t valueHi)
-{
-    const uint32_t byteIndex = watchAddr - writeAddr;
-    if (byteIndex < 8u)
-    {
-        return static_cast<uint8_t>((valueLo >> (byteIndex * 8u)) & 0xFFu);
-    }
-    return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
+    return writeEnd > watchStart && writeStart < watchStart + static_cast<uint64_t>(bytes);
 }
 
 inline void ps2TraceGuestWrite(uint8_t *rdram,
@@ -270,51 +382,14 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
     }
 
     const uint32_t writeAddr = guestAddr & PS2_RAM_MASK;
-    if (!ps2PathWatchIntersects(writeAddr, size))
+    if (ps2SlotWatchIntersects(writeAddr, size))
     {
-        return;
+        ps2DiagSlotWatchReport(writeAddr, size, valueLo, valueHi, op, ctx);
     }
-
-    const uint32_t logIndex = g_ps2PathWatchLogCount.fetch_add(1, std::memory_order_relaxed);
-    if (logIndex >= PS2_PATH_WATCH_MAX_LOGS)
+    if (ps2PathWatchIntersects(writeAddr, size))
     {
-        return;
+        ps2DiagPathWatchReport(rdram, writeAddr, size, valueLo, valueHi, op, ctx);
     }
-
-    const uint32_t watchAddr = ps2PathWatchPhysAddr();
-    const bool touchesFirstByte = (watchAddr >= writeAddr) && (watchAddr < writeAddr + size);
-    const uint8_t oldByte = rdram[watchAddr];
-    const uint8_t newByte = touchesFirstByte ? ps2PathWatchExtractByteFromWrite(writeAddr, watchAddr, valueLo, valueHi) : oldByte;
-
-    const uint32_t pc = ctx ? ctx->pc : 0u;
-    const uint32_t ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
-    const uint32_t sp = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
-
-    auto flags = std::cout.flags();
-    std::cout << "[watch:path-write] #" << (logIndex + 1u)
-              << " op=" << op
-              << " addr=0x" << std::hex << writeAddr
-              << " size=0x" << size
-              << " pc=0x" << pc
-              << " ra=0x" << ra
-              << " sp=0x" << sp
-              << " vLo=0x" << valueLo;
-    if (size > 8u)
-    {
-        std::cout << " vHi=0x" << valueHi;
-    }
-    if (touchesFirstByte)
-    {
-        std::cout << " firstByte:" << static_cast<uint32_t>(oldByte)
-                  << "->" << static_cast<uint32_t>(newByte);
-        if (oldByte != 0u && newByte == 0u)
-        {
-            std::cout << " (ZEROED)";
-        }
-    }
-    ps2PathWatchDumpPrefix(rdram);
-    std::cout.flags(flags);
-    std::cout << std::endl;
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
@@ -329,34 +404,14 @@ inline void ps2TraceGuestRangeWrite(uint8_t *rdram,
     }
 
     const uint32_t writeAddr = guestAddr & PS2_RAM_MASK;
-    if (!ps2PathWatchIntersects(writeAddr, size))
+    if (ps2SlotWatchIntersects(writeAddr, size))
     {
-        return;
+        ps2DiagSlotWatchReport(writeAddr, size, 0u, 0u, op, ctx);
     }
-
-    const uint32_t logIndex = g_ps2PathWatchLogCount.fetch_add(1, std::memory_order_relaxed);
-    if (logIndex >= PS2_PATH_WATCH_MAX_LOGS)
+    if (ps2PathWatchIntersects(writeAddr, size))
     {
-        return;
+        ps2DiagPathRangeReport(rdram, writeAddr, size, op, ctx);
     }
-
-    const uint32_t pc = ctx ? ctx->pc : 0u;
-    const uint32_t ra = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)) : 0u;
-    const uint32_t sp = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
-    const uint8_t firstByte = rdram[ps2PathWatchPhysAddr()];
-
-    auto flags = std::cout.flags();
-    std::cout << "[watch:path-range] #" << (logIndex + 1u)
-              << " op=" << op
-              << " addr=0x" << std::hex << writeAddr
-              << " size=0x" << size
-              << " pc=0x" << pc
-              << " ra=0x" << ra
-              << " sp=0x" << sp
-              << " firstByte=" << static_cast<uint32_t>(firstByte);
-    ps2PathWatchDumpPrefix(rdram);
-    std::cout.flags(flags);
-    std::cout << std::endl;
 }
 
 struct PS2SoundDriverCompatLayout
@@ -596,7 +651,14 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
+    // Async callback stack pool floor. The pool carves DOWNWARD from
+    // PS2_RAM_SIZE; the floor must sit ABOVE the EE main thread's stack top,
+    // otherwise async host-dispatched guest callbacks (GS vsync / INTC /
+    // alarm) run on memory that is the main thread's live stack. 0x01FC0000
+    // gives the pool [0x01FC0000, 0x02000000) = 256 KB. Kept in sync with
+    // the init sites in ps2_runtime.cpp (resetCPUState / loadELF) and the
+    // main-thread SP cap in run().
+    uint32_t m_asyncCallbackStackFloor = 0x01FC0000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 
     std::unordered_map<uint32_t, RecompiledFunction> m_functionTable;

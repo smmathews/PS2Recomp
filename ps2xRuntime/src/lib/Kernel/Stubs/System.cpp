@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "System.h"
 
+#include <iostream>
+
 namespace ps2_stubs
 {
     void builtin_set_imask(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -26,6 +28,13 @@ namespace ps2_stubs
 
     void exit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Guest-initiated exit tears down the whole runtime; always log it so a
+        // silent shutdown can be traced to its guest call site.
+        std::cerr << "[exit] guest called exit()"
+                  << " pc=0x" << std::hex << (ctx ? ctx->pc : 0u)
+                  << " ra=0x" << (ctx ? getRegU32(ctx, 31) : 0u)
+                  << " a0=0x" << (ctx ? getRegU32(ctx, 4) : 0u)
+                  << std::dec << std::endl;
         if (runtime)
         {
             runtime->requestStop();

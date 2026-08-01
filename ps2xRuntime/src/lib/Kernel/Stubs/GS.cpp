@@ -232,7 +232,16 @@ namespace ps2_stubs
                                bool hasClearPacket)
         {
             static uint32_t s_swapProbeCount = 0u;
-            if (!runtime || s_swapProbeCount >= 24u)
+            static const uint32_t kMaxSwapProbeLogs =
+                ps2DiagEnvLimit("PS2X_GS_SWAPPROBE_MAX_LOGS", 24u);
+            static std::atomic<bool> s_swapProbeTruncated{false};
+            if (!runtime ||
+                !ps2DiagLogBudget(std::cout,
+                                  "[gs:probe]",
+                                  "PS2X_GS_SWAPPROBE_MAX_LOGS",
+                                  kMaxSwapProbeLogs,
+                                  s_swapProbeCount,
+                                  s_swapProbeTruncated))
             {
                 return;
             }
@@ -289,7 +298,15 @@ namespace ps2_stubs
                                   uint32_t aux1)
         {
             static uint32_t s_vif1PacketOpLogCount = 0u;
-            if (s_vif1PacketOpLogCount >= 96u)
+            static const uint32_t kMaxVif1PacketOpLogs =
+                ps2DiagEnvLimit("PS2X_VIF1_PACKET_MAX_LOGS", 96u);
+            static std::atomic<bool> s_vif1PacketOpTruncated{false};
+            if (!ps2DiagLogBudget(std::cout,
+                                  "[vif1:packet]",
+                                  "PS2X_VIF1_PACKET_MAX_LOGS",
+                                  kMaxVif1PacketOpLogs,
+                                  s_vif1PacketOpLogCount,
+                                  s_vif1PacketOpTruncated))
             {
                 return;
             }
@@ -339,6 +356,9 @@ namespace ps2_stubs
             }
 
             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
+            // Fill in the closing block's QWC exactly once, here (see the note on
+            // writePacketBuilderCurrent above for why this is not done eagerly).
+            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
             writeGuestBytes(rdram,
                             runtime,
                             stateAddr + 8u,
@@ -437,10 +457,34 @@ namespace ps2_stubs
             writeGuestU32(rdram, runtime, pendingCountAddr, countWord);
         }
 
+        // NOTE (2026-07-20): this ONLY advances the builder's write cursor. It
+        // deliberately does NOT patch the pending DMAtag's QWC field -- that is
+        // done exactly once, in terminatePacketBuilderState() below, which is
+        // what the real sceGifPk library does (the count is filled in when the
+        // block is closed, not incrementally as data is appended).
+        //
+        // WHY THIS MATTERS (DQ8 FMV, dq8 sec 3.33): a game may link its OWN copy
+        // of the sceGifPk library and only land a few leaf entry points on our
+        // stubs. DQ8's movie texture-upload builder (func_19E5F0 @0x19e5f0) is
+        // exactly that shape: the CNT-tag open (func_10A700) and the block
+        // terminate (func_10A6A8) are recompiled GUEST code, while sceGifPkAddGsAD
+        // and sceGifPkCloseGifTag are ours. The guest's terminate patches the tag
+        // with `[tag] += (delta/16 - 1)` (an ADD onto a zero-seeded field), so our
+        // eager per-append "set" made the QWC count TWICE (observed 6 where the
+        // block held 3 qwords). An over-long CNT then swallows every following
+        // DMAtag as inline data -- in DQ8 that ate all 896 REF tags pointing at
+        // the decoded movie frame, so the movie's pixel data never entered the
+        // GIF stream at all and the chain terminated after 2 tags.
+        //
+        // Same double-count family as the earlier sceGifPkRefLoadImage nloop fix
+        // (commit 5eb57b6). Regression risk: only a caller that reads a pending
+        // tag's QWC BEFORE the block is terminated would see a difference, and
+        // such a read would be wrong on hardware too -- every stub that opens a
+        // new tag (Cnt/End/Ref/RefLoadImage/Terminate) terminates the previous
+        // block first, so the stub-only path is byte-for-byte unchanged.
         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
         {
             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
         }
 
         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
@@ -677,7 +721,15 @@ namespace ps2_stubs
                             sizeof(words));
             writePacketBuilderCurrent(rdram, runtime, stateAddr, packetAddr + 16u);
 
-            const uint64_t giftag[2] = {makeGiftagAplusD(4u), 0xEULL};
+            // Seed nloop=0/eop=0/nreg=1/A+D (matches the real guest's static
+            // packet template) -- NOT makeGiftagAplusD(4u). closePacketGifTag
+            // below computes the actual appended qword count from the address
+            // delta and ADDS it to this seed; pre-seeding nloop=4 here made it
+            // double-count (nloop=8 instead of the correct nloop=4), starving
+            // the font CLUT uploads that follow this tag. Final tag value
+            // after the close is 0x1000000000000004, byte-identical to
+            // hardware.
+            const uint64_t giftag[2] = {(1ULL << 60), 0xEULL};
             uint32_t currentAddr = packetAddr + 16u;
             writeGuestBytes(rdram, runtime, currentAddr, reinterpret_cast<const uint8_t *>(giftag), sizeof(giftag));
             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr + 16u);
@@ -821,10 +873,28 @@ namespace ps2_stubs
             }
         }
 
+        {
+            static uint32_t s_dispatchTotal = 0u;
+            uint32_t n = s_dispatchTotal++;
+            if (n < 3u || (n % 60u) == 0u)
+            {
+                std::cerr << "[sceGsSyncVCallback:dispatch #" << n
+                          << "] cb=0x" << std::hex << callback
+                          << std::dec << '\n';
+            }
+        }
         if (!runtime->hasFunction(callback))
         {
             static uint32_t s_missingCallbackLogCount = 0u;
-            if (s_missingCallbackLogCount < 32u)
+            static const uint32_t kMaxMissingCallbackLogs =
+                ps2DiagEnvLimit("PS2X_GS_MISSING_CB_MAX_LOGS", 32u);
+            static std::atomic<bool> s_missingCallbackTruncated{false};
+            if (ps2DiagLogBudget(std::cerr,
+                                 "[sceGsSyncVCallback:missing]",
+                                 "PS2X_GS_MISSING_CB_MAX_LOGS",
+                                 kMaxMissingCallbackLogs,
+                                 s_missingCallbackLogCount,
+                                 s_missingCallbackTruncated))
             {
                 std::cerr << "[sceGsSyncVCallback:missing] cb=0x" << std::hex << callback
                           << " gp=0x" << gp
@@ -853,15 +923,35 @@ namespace ps2_stubs
 
         try
         {
+            // Acquire the guest token before running recompiled PS2 code.
+            // This is a local RAII guard equivalent to AsyncGuestScope from Runtime.h
+            // but defined here to avoid pulling in that header's unresolved symbols.
+            struct GsGuestScope {
+                GsGuestScope()  { ps2sched::async_guest_begin(); }
+                ~GsGuestScope() { ps2sched::async_guest_end();   }
+                GsGuestScope(const GsGuestScope&) = delete;
+                GsGuestScope& operator=(const GsGuestScope&) = delete;
+            } guestScope;
             R5900Context callbackCtx{};
             SET_GPR_U32(&callbackCtx, 28, gp);
-            SET_GPR_U32(&callbackCtx, 29, (callbackStackTop != 0u) ? callbackStackTop : (PS2_RAM_SIZE - 0x10u));
+            // Failure fallback: top of the kernel-area callback pool, not
+            // PS2_RAM_SIZE-0x10 (that is inside the guest's own main stack).
+            SET_GPR_U32(&callbackCtx, 29, (callbackStackTop != 0u) ? callbackStackTop : (0x00100000u - 0x10u));
             SET_GPR_U32(&callbackCtx, 31, 0u);
             SET_GPR_U32(&callbackCtx, 4, static_cast<uint32_t>(callbackTick));
             callbackCtx.pc = callback;
 
             static uint32_t s_dispatchLogCount = 0u;
-            const bool shouldLogDispatch = (s_dispatchLogCount < 64u);
+            static const uint32_t kMaxDispatchLogs =
+                ps2DiagEnvLimit("PS2X_GS_DISPATCH_MAX_LOGS", 64u);
+            static std::atomic<bool> s_dispatchLogTruncated{false};
+            const bool shouldLogDispatch =
+                ps2DiagLogBudget(std::cout,
+                                 "[sceGsSyncVCallback:dispatch]",
+                                 "PS2X_GS_DISPATCH_MAX_LOGS",
+                                 kMaxDispatchLogs,
+                                 s_dispatchLogCount,
+                                 s_dispatchLogTruncated);
             if (shouldLogDispatch)
             {
                 RUNTIME_LOG("[sceGsSyncVCallback:dispatch] cb=0x" << std::hex << callback
@@ -876,7 +966,15 @@ namespace ps2_stubs
             {
                 if (!runtime->hasFunction(callbackCtx.pc))
                 {
-                    if (g_gs_sync_v_callback_bad_pc_logs < 16u)
+                    static const uint32_t kMaxBadPcLogs =
+                        ps2DiagEnvLimit("PS2X_GS_BADPC_MAX_LOGS", 16u);
+                    static std::atomic<bool> s_badPcTruncated{false};
+                    if (ps2DiagLogBudget(std::cerr,
+                                         "[sceGsSyncVCallback:bad-pc]",
+                                         "PS2X_GS_BADPC_MAX_LOGS",
+                                         kMaxBadPcLogs,
+                                         g_gs_sync_v_callback_bad_pc_logs,
+                                         s_badPcTruncated))
                     {
                         std::cerr << "[sceGsSyncVCallback:bad-pc] pc=0x" << std::hex << callbackCtx.pc
                                   << " ra=0x" << getRegU32(&callbackCtx, 31)
@@ -907,11 +1005,31 @@ namespace ps2_stubs
                                                                 << std::dec << std::endl);
                 ++s_dispatchLogCount;
             }
+            {
+                static uint32_t s_postCount = 0u;
+                uint32_t pn = s_postCount++;
+                if (pn < 3u || (pn % 60u) == 0u)
+                {
+                    std::lock_guard<std::mutex> lk(g_gs_sync_v_callback_mutex);
+                    std::cerr << "[sceGsSyncVCallback:post-dispatch #" << pn
+                              << "] steps=" << steps
+                              << " cb=0x" << std::hex << g_gs_sync_v_callback_func
+                              << std::dec << '\n';
+                }
+            }
         }
         catch (const std::exception &e)
         {
             static uint32_t warnCount = 0u;
-            if (warnCount < 8u)
+            static const uint32_t kMaxWarnLogs =
+                ps2DiagEnvLimit("PS2X_GS_CALLBACK_EXC_MAX_LOGS", 8u);
+            static std::atomic<bool> s_warnTruncated{false};
+            if (ps2DiagLogBudget(std::cerr,
+                                 "[sceGsSyncVCallback:exception]",
+                                 "PS2X_GS_CALLBACK_EXC_MAX_LOGS",
+                                 kMaxWarnLogs,
+                                 warnCount,
+                                 s_warnTruncated))
             {
                 std::cerr << "[sceGsSyncVCallback] callback exception: " << e.what() << std::endl;
                 ++warnCount;
@@ -1140,34 +1258,36 @@ namespace ps2_stubs
 
             if (runtime)
             {
-                uint32_t pktAddr = runtime->guestMalloc(128u, 16u);
+                // PMODE (0x41) and SMODE2 (0x42) conflict with GS drawing registers
+                // SCISSOR_2 and ALPHA_1 in the GIF A+D address space, so write them
+                // directly to the privileged register struct instead.
+                runtime->memory().gs().pmode = pmode;
+                runtime->memory().gs().smode2 = smode2;
+
+                uint32_t pktAddr = runtime->guestMalloc(96u, 16u);
                 if (pktAddr != 0u)
                 {
                     uint8_t *pkt = getMemPtr(rdram, pktAddr);
                     if (pkt)
                     {
                         uint64_t *q = reinterpret_cast<uint64_t *>(pkt);
-                        q[0] = makeGiftagAplusD(7u);
+                        q[0] = makeGiftagAplusD(5u);
                         q[1] = 0xEULL;
-                        q[2] = pmode;
-                        q[3] = 0x41ULL;
-                        q[4] = smode2;
-                        q[5] = 0x42ULL;
+                        q[2] = dispfb;
+                        q[3] = 0x59ULL;
+                        q[4] = display;
+                        q[5] = 0x5aULL;
                         q[6] = dispfb;
-                        q[7] = 0x59ULL;
+                        q[7] = 0x5bULL;
                         q[8] = display;
-                        q[9] = 0x5aULL;
-                        q[10] = dispfb;
-                        q[11] = 0x5bULL;
-                        q[12] = display;
-                        q[13] = 0x5cULL;
-                        q[14] = bgcolor;
-                        q[15] = 0x5fULL;
+                        q[9] = 0x5cULL;
+                        q[10] = bgcolor;
+                        q[11] = 0x5fULL;
                         constexpr uint32_t GIF_CHANNEL = 0x1000A000;
                         constexpr uint32_t CHCR_STR_MODE0 = 0x101u;
                         auto &mem = runtime->memory();
                         mem.writeIORegister(GIF_CHANNEL + 0x10u, pktAddr);
-                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 8u);
+                        mem.writeIORegister(GIF_CHANNEL + 0x20u, 6u);
                         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
                         mem.processPendingTransfers();
                         runtime->guestFree(pktAddr);
@@ -1273,9 +1393,18 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
+        // SPEC 02 EABI-vs-o32 audit (dq8/reference/dc2-learnings/02-*.md, DC2
+        // G194): args 5-7 (ztest/zpsm/clear) arrive in $t0/$t1/$t2 under EABI,
+        // not on the stack at sp+16/20/24 -- that o32 convention reads caller
+        // junk here. The sibling sceGsSetDefDBuffDc already gets this right
+        // via decodeGsTrailingArgs3 (regs-first, stack-fallback); this stub
+        // was the one DC2's G194 predicted would still be wrong. DQ8 calls
+        // this exact stub (sub_00108F28), so the bug was live: it seeded a
+        // wrong ZPSM/ZTEST into the depth-buffer config for every frame.
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
         (void)clear;
 
         if (w == 0u)
@@ -1477,7 +1606,15 @@ namespace ps2_stubs
 
         applyGsDispEnv(runtime, db.disp[which]);
         static uint32_t s_swapDbuffLogCount = 0u;
-        if (s_swapDbuffLogCount < 32u)
+        static const uint32_t kMaxSwapDbuffLogs =
+            ps2DiagEnvLimit("PS2X_GS_SWAPDBUFF_MAX_LOGS", 32u);
+        static std::atomic<bool> s_swapDbuffTruncated{false};
+        if (ps2DiagLogBudget(std::cout,
+                             "[gs:swapdbuff]",
+                             "PS2X_GS_SWAPDBUFF_MAX_LOGS",
+                             kMaxSwapDbuffLogs,
+                             s_swapDbuffLogCount,
+                             s_swapDbuffTruncated))
         {
             const uint32_t dispFbp = static_cast<uint32_t>(db.disp[which].dispfb & 0x1FFu);
             const uint32_t clearContext = (which == 0u)
@@ -1647,9 +1784,20 @@ namespace ps2_stubs
                 g_gs_sync_v_callback_sp = sp;
             }
         }
+        std::cerr << "[sceGsSyncVCallback:register] new=0x" << std::hex << newCallback
+                  << " old=0x" << oldCallback << " callerPc=0x" << callerPc
+                  << " callerRa=0x" << callerRa << std::dec << '\n';
 
         static uint32_t s_syncVCallbackLogCount = 0u;
-        if (s_syncVCallbackLogCount < 128u)
+        static const uint32_t kMaxSyncVCallbackLogs =
+            ps2DiagEnvLimit("PS2X_GS_SYNCV_CALLBACK_MAX_LOGS", 128u);
+        static std::atomic<bool> s_syncVCallbackTruncated{false};
+        if (ps2DiagLogBudget(std::cout,
+                             "[sceGsSyncVCallback:set]",
+                             "PS2X_GS_SYNCV_CALLBACK_MAX_LOGS",
+                             kMaxSyncVCallbackLogs,
+                             s_syncVCallbackLogCount,
+                             s_syncVCallbackTruncated))
         {
             RUNTIME_LOG("[sceGsSyncVCallback:set] new=0x" << std::hex << newCallback
                                                           << " old=0x" << oldCallback

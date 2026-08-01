@@ -7,9 +7,6 @@
 
 // ps2_iop.cpp
 
-namespace
-{
-}
 ps2_iop::ps2_iop()
 {
     reset();
@@ -22,6 +19,11 @@ void ps2_iop::init(uint8_t *rdram)
 
 void ps2_iop::reset()
 {
+}
+
+void ps2_iop::registerRpcHandler(uint32_t sid, IopRpcHandlerFn handler)
+{
+    m_handlers[sid] = std::move(handler);
 }
 
 bool ps2_iop::handleRPC(PS2Runtime *runtime,
@@ -65,6 +67,17 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
         ps2_iop_audio::handleLibSdRpc(runtime, sid, rpcNum, sendPtr, sendSize, recvPtr, recvSize);
         resultPtr = recvBufAddr;
         return true;
+    }
+
+    // Check game-specific registered handlers.
+    auto it = m_handlers.find(sid);
+    if (it != m_handlers.end())
+    {
+        return it->second(m_rdram,
+                          sid, rpcNum,
+                          sendBufAddr, sendSize,
+                          recvBufAddr, recvSize,
+                          resultPtr);
     }
 
     return false;

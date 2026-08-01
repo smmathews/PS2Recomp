@@ -9,7 +9,23 @@ namespace ps2_syscalls
 
     void notifyRuntimeStop()
     {
-        stopInterruptWorker();
+        // requestStop can be invoked from GUEST context (e.g. the
+        // unimplemented-function default handler runs on the guest executor
+        // thread, inside a fiber). Joining a host worker from there can
+        // deadlock: a worker blocked in async_guest_begin() waits for
+        // g_running_fiber == nullptr, which cannot happen while the joining
+        // fiber IS the running fiber. In that case only signal the workers to
+        // stop; scheduler_shutdown() joins them later on the main thread
+        // (both stop functions are idempotent).
+        const bool fromGuestExecutor = ps2sched::is_guest_thread();
+        if (fromGuestExecutor)
+        {
+            signalInterruptWorkerStop();
+        }
+        else
+        {
+            stopInterruptWorker();
+        }
         {
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             g_intcHandlers.clear();
@@ -39,10 +55,16 @@ namespace ps2_syscalls
             g_threads.clear();
             g_nextThreadId = 2; // Reserve id 1 for main thread.
         }
-        // -1 is the "not a guest fiber" sentinel. notifyRuntimeStop runs on a
-        // host thread (not the guest executor), which must never be mistaken for
-        // a real guest thread id by arm_park / wait-list operations.
-        g_currentThreadId = -1;
+        // -1 is the "not a guest fiber" sentinel: a host thread running
+        // notifyRuntimeStop must never be mistaken for a real guest thread id
+        // by arm_park / wait-list operations. Do NOT clobber it when called
+        // from guest context, though -- there g_currentThreadId identifies the
+        // still-running fiber on the executor thread, and zapping it would
+        // corrupt that fiber's identity for the rest of its unwind.
+        if (!fromGuestExecutor)
+        {
+            g_currentThreadId = -1;
+        }
 
         for (const auto &[tid, threadInfo] : threads)
         {
@@ -109,8 +131,18 @@ namespace ps2_syscalls
         }
 
         // Stop and JOIN the alarm worker BEFORE clearing alarms, so no callback can
-        // fire against rdram/runtime that is about to be destroyed.
-        ps2_syscalls::stopAlarmWorker();
+        // fire against rdram/runtime that is about to be destroyed. From guest
+        // context, signal-only (see header comment above): the worker re-checks
+        // the stop flag before invoking any callback, and scheduler_shutdown()
+        // performs the join on the main thread.
+        if (fromGuestExecutor)
+        {
+            ps2_syscalls::signalAlarmWorkerStop();
+        }
+        else
+        {
+            ps2_syscalls::stopAlarmWorker();
+        }
         {
             std::lock_guard<std::mutex> lock(g_alarm_mutex);
             g_alarms.clear();

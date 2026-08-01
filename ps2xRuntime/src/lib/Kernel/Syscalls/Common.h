@@ -31,6 +31,8 @@
 
 std::string translatePs2Path(const char *ps2Path);
 
+#include "runtime/ps2_sounddriver.h"
+
 #include "Helpers/Path.h"
 #include "Helpers/State.h"
 #include "Helpers/Loader.h"

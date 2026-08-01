@@ -44,7 +44,13 @@ namespace ps2_stubs
         struct PadPortState
         {
             bool open = false;
-            bool analogMode = true;
+            // Hardware-faithful: a freshly opened pad reports DIGITAL
+            // (CURID=4, mode byte 0x41) until the game calls
+            // scePadSetMainMode(..., mode=1). Opening in analog mode broke
+            // games that gate on scePadInfoMode(CURID)==7 semantics (e.g.
+            // DQ8's fn_165b20 movie-skip check expects the analog upgrade
+            // to be the game's own doing).
+            bool analogMode = false;
             bool pressureEnabled = false;
             uint16_t buttonMask = 0xFFFFu;
             uint32_t dmaAddr = 0u;
@@ -57,6 +63,7 @@ namespace ps2_stubs
         PadInputState g_padOverrideState{};
         PadPortState g_padPorts[kPadPortCount]{};
         int g_padReadLogCount = 0;
+        std::atomic<bool> g_padReadLogTruncated{false};
 
         uint8_t axisToByte(float axis)
         {
@@ -207,7 +214,7 @@ namespace ps2_stubs
         void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
         {
             portState.open = true;
-            portState.analogMode = true;
+            portState.analogMode = false; // real pads open DIGITAL (CURID=4)
             portState.pressureEnabled = false;
             portState.buttonMask = 0xFFFFu;
             portState.dmaAddr = dmaAddr;
@@ -563,7 +570,7 @@ namespace ps2_stubs
         }
 
         portState->open = true;
-        portState->analogMode = true;
+        portState->analogMode = false; // real pads open DIGITAL (CURID=4)
         portState->pressureEnabled = false;
         portState->buttonMask = 0xFFFFu;
         portState->dmaAddr = dmaAddr;
@@ -593,7 +600,14 @@ namespace ps2_stubs
             return;
         }
 
-        if (g_padReadLogCount < 48)
+        static const uint32_t kMaxPadReadLogs =
+            ps2DiagEnvLimit("PS2X_PADREAD_MAX_LOGS", 48u);
+        if (ps2DiagLogBudget(std::cout,
+                             "[padread]",
+                             "PS2X_PADREAD_MAX_LOGS",
+                             kMaxPadReadLogs,
+                             static_cast<uint32_t>(g_padReadLogCount),
+                             g_padReadLogTruncated))
         {
             const int gamepad = findFirstGamepad();
             const bool gamepadStartPressed =

@@ -155,6 +155,19 @@ struct SemaInfo
     // where the token was captured via ps2sched::current_fiber_token() at push
     // time. Protected by m; never hold m across a scheduling yield.
     std::vector<std::pair<int, uint64_t>> waitList;
+    // Permits handed off directly to an already-dequeued waiter (see
+    // SignalSema in Sync.cpp). A real EE kernel signal-with-a-waiter-present
+    // transfers the token straight to that waiter instead of making it
+    // visible as a general-purpose count; without this, a second
+    // Poll/WaitSema call from a DIFFERENT thread that runs before the woken
+    // waiter is actually scheduled can steal the just-signaled count out
+    // from under it (guaranteed, not probabilistic, under a cooperative
+    // single-runner fiber scheduler), leaving the woken thread's Mesa
+    // re-check with count==0 -- it re-blocks as "spurious", and the signal
+    // is lost forever. Only the WaitSema resume path for a thread that was
+    // actually popped off waitList consumes this; PollSema/fast-path
+    // WaitSema never see it, so it can't be stolen.
+    int reservedGrants = 0;
 };
 
 struct EventFlagInfo
@@ -264,6 +277,9 @@ inline uint32_t g_rpc_server_index = 0;
 inline uint32_t g_rpc_active_queue = 0;
 inline SoundDriverRpcState g_soundDriverRpcState;
 inline PS2SoundDriverCompatLayout g_soundDriverCompatLayout;
+// Game-parameterized SoundDriver (SDRDRV-family) HLE layout; see
+// runtime/ps2_sounddriver.h. Guarded by g_rpc_mutex.
+inline PS2SoundDriverGameLayout g_soundDriverGameLayout;
 inline PS2DtxCompatLayout g_dtxCompatLayout;
 inline std::mutex g_dtx_rpc_mutex;
 inline std::unordered_map<uint32_t, uint32_t> g_dtx_remote_by_id;

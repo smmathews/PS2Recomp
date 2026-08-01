@@ -69,6 +69,105 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
     return static_cast<uint32_t>(std::countl_zero(x)) - 1;
 }
 
+// ---------------------------------------------------------------------------
+// R5900 COP1 / VU floating-point result conditioning
+// ---------------------------------------------------------------------------
+//
+// Neither the EE FPU nor either VU is IEEE-754, and the difference is not a
+// rounding detail -- it changes which values can exist at all. There are no
+// infinities and no NaNs. The exponent-255 encodings that IEEE reserves for
+// them are ordinary very large numbers on this hardware, so an operation whose
+// true result exceeds Fmax = 0x7F7FFFFF writes +/-Fmax and raises the MAC O
+// flag instead of overflowing to Inf, and a divide by zero writes +/-Fmax with
+// the D flag set instead of producing an infinity.
+//
+// Sources:
+//   * EE User's Manual, "FPU (COP1)" -- the FPU does not support the IEEE
+//     infinity or NaN encodings; an overflowing result saturates to the
+//     maximum representable magnitude.
+//   * PCSX2 is the practical reference implementation. pcsx2/VUops.cpp,
+//     VU_MACx_UPDATE(): "else if (exp == 255) { macflag |= O; return
+//     s | 0x7f7fffff; }" -- the clamped value is what actually lands in the
+//     register, not merely a flag. pcsx2/FPU.cpp, checkOverflow() rewrites an
+//     infinite result to "(xReg & 0x80000000) | posFmax", and DIV_S/RSQRT_S
+//     return "((_FsValUl_ ^ _FtValUl_) & 0x80000000) | posFmax" when the
+//     divisor is zero.
+//
+// Handing the guest a host IEEE infinity is therefore never faithful, and it
+// is actively destructive: guest code cannot produce one, so nothing
+// downstream is written to survive one, and the first Inf*0 or Inf-Inf turns
+// it into a NaN (0xFFC00000) that then propagates through every matrix,
+// vertex and comparison it touches. A saturated Fmax stays a number: it keeps
+// multiplying, cancelling and comparing the way the guest's own code expects.
+//
+// Clamping every producer maintains a total invariant -- no float reachable by
+// guest arithmetic is ever non-finite. Given finite operands, add/sub/mul/div
+// can only overflow; they cannot manufacture a NaN. So the result clamp alone
+// is sufficient and no operand-side conditioning is needed on the hot path.
+//
+// Cost: two SSE instructions, branch-free, no memory traffic. MINPS/MINSS
+// return their *second* source when either operand is NaN, so the min against
+// +Fmax maps +Inf and every NaN encoding onto +Fmax in one instruction; the
+// max against -Fmax then catches -Inf.
+//
+// Denormals: the guest FPU has none either (a denormal result flushes to
+// signed zero and raises U). That is emulated where the exponent is already
+// being examined for the flag update -- VU1Interpreter::applyDest -- rather
+// than here, because on this path it would cost two more instructions per op
+// to replace a denormal with a value that differs from it by less than 2^-126.
+#define PS2_FPU_MAX 3.4028234663852886e+38f
+
+// LEG for the VOPMUL elimination test (2026-07-28): float conditioning back
+// ON (matches the so_cases3 config: 0% all-NaN, architecturally correct per
+// spec 25). Only the VOPMULA/VOPMSUB codegen is being reverted for this run;
+// conditioning is left enabled per that test's explicit constraint. The
+// previous LEG-ACTIVE state (conditioning off, to match the old MIX corpus)
+// is preserved below for reference.
+// #define PS2X_BISECT_NO_FLOAT_COND 1
+//
+// Both switches below were used to bisect the render blackout and both legs
+// came back BLACK, so neither change is the cause:
+//   #define PS2X_BISECT_NO_FLOAT_COND 1   -- conditioning off, VOPMUL on
+//   #define PS2X_BISECT_NO_VOPMUL     1   -- conditioning on, VOPMUL legacy
+// Define either one (and rebuild the corpus, not just the runtime) to re-run a
+// leg. They are #defines rather than -D flags so flipping legs does not force a
+// CMake reconfigure of both build trees. The remaining untested candidate is
+// the inline divide-by-zero emission, which is NOT macro-switchable and needs a
+// regenerate. See restartdq8recomp/FINDINGS-2026-07-27-render-bisect.md.
+
+// BISECT SWITCH (temporary, NOT for upstream): -DPS2X_BISECT_NO_FLOAT_COND
+// makes every float-conditioning helper a pass-through, so a build can carry
+// the codegen-side PS2_VOPMUL cross-product emission WITHOUT the header-side
+// saturation and magnitude-sqrt changes. This splits "which half of the bundle
+// blacks out the render" without paying for a corpus regenerate, because these
+// macros expand at C++ compile time rather than at recompile time.
+#ifdef PS2X_BISECT_NO_FLOAT_COND
+
+static inline float ps2_fpu_sat(float v) { return v; }
+static inline __m128 ps2_vu_sat(__m128 v) { return v; }
+
+#else
+
+static inline float ps2_fpu_sat(float v)
+{
+    __m128 x = _mm_set_ss(v);
+    x = _mm_min_ss(x, _mm_set_ss(PS2_FPU_MAX));
+    x = _mm_max_ss(x, _mm_set_ss(-PS2_FPU_MAX));
+    return _mm_cvtss_f32(x);
+}
+
+static inline __m128 ps2_vu_sat(__m128 v)
+{
+    v = _mm_min_ps(v, _mm_set1_ps(PS2_FPU_MAX));
+    v = _mm_max_ps(v, _mm_set1_ps(-PS2_FPU_MAX));
+    return v;
+}
+
+#endif
+
+#define PS2_FPU_SAT(v) ps2_fpu_sat((float)(v))
+#define PS2_VU_SAT(v) ps2_vu_sat((__m128)(v))
+
 #define PS2_BLENDV_PS(a, b, mask) _mm_blendv_ps((a), (b), (mask))
 #define PS2_MIN_EPI32(a, b) _mm_min_epi32((a), (b))
 #define PS2_MAX_EPI32(a, b) _mm_max_epi32((a), (b))
@@ -141,12 +240,39 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 #define PS2_PNOR(a, b) _mm_xor_si128(_mm_or_si128((__m128i)(a), (__m128i)(b)), _mm_set1_epi32(0xFFFFFFFF))
 
 // PS2 VU (Vector Unit) operations
-#define PS2_VADD(a, b) _mm_add_ps((__m128)(a), (__m128)(b))
-#define PS2_VSUB(a, b) _mm_sub_ps((__m128)(a), (__m128)(b))
-#define PS2_VMUL(a, b) _mm_mul_ps((__m128)(a), (__m128)(b))
-#define PS2_VDIV(a, b) _mm_div_ps((__m128)(a), (__m128)(b))
-#define PS2_VMULQ(a, q) _mm_mul_ps((__m128)(a), _mm_set1_ps(q))
+// Every FMAC result saturates at +/-Fmax -- see PS2_VU_SAT above.
+#define PS2_VADD(a, b) PS2_VU_SAT(_mm_add_ps((__m128)(a), (__m128)(b)))
+#define PS2_VSUB(a, b) PS2_VU_SAT(_mm_sub_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMUL(a, b) PS2_VU_SAT(_mm_mul_ps((__m128)(a), (__m128)(b)))
+#define PS2_VDIV(a, b) PS2_VU_SAT(_mm_div_ps((__m128)(a), (__m128)(b)))
+#define PS2_VMULQ(a, q) PS2_VU_SAT(_mm_mul_ps((__m128)(a), _mm_set1_ps(q)))
 #define PS2_VBLEND(a, b, mask) PS2_BLENDV_PS((__m128)(a), (__m128)(b), (__m128)(mask))
+
+// VOPMULA / VOPMSUB partial term. These two are NOT component-wise multiplies:
+// they are the outer-product pair the VU uses to build a cross product, where
+// each lane multiplies the *next* lane of fs by the lane after that of ft:
+//   lane x = fs.y * ft.z,  lane y = fs.z * ft.x,  lane z = fs.x * ft.y
+// so that the canonical pair
+//   VOPMULA.xyz ACC, a, b ; VOPMSUB.xyz d, b, a
+// yields d = a x b. Emitting a plain PS2_VMUL for both halves makes VOPMSUB
+// compute (a*b) - (b*a), i.e. identically zero, silently killing every cross
+// product in the program. The w lane is don't-care on hardware; every
+// VOPMULA/VOPMSUB in practice is issued with an .xyz destination mask.
+//
+// BISECT SWITCH (temporary, NOT for upstream): -DPS2X_BISECT_NO_VOPMUL makes
+// PS2_VOPMUL expand to the legacy component-wise multiply, restoring the old
+// (identically-zero) cross-product behaviour WITHOUT a corpus regenerate -- the
+// generated code already calls PS2_VOPMUL, and this macro is what gives it
+// meaning. Pairs with PS2X_BISECT_NO_FLOAT_COND to separate the two remaining
+// codegen-side candidates for the render blackout.
+#ifdef PS2X_BISECT_NO_VOPMUL
+#define PS2_VOPMUL(fs, ft) PS2_VU_SAT(_mm_mul_ps((__m128)(fs), (__m128)(ft)))
+#else
+#define PS2_VOPMUL(fs, ft)                                                                  \
+    PS2_VU_SAT(                                                                             \
+        _mm_mul_ps(_mm_shuffle_ps((__m128)(fs), (__m128)(fs), _MM_SHUFFLE(3, 0, 2, 1)),      \
+                   _mm_shuffle_ps((__m128)(ft), (__m128)(ft), _MM_SHUFFLE(3, 1, 0, 2))))
+#endif
 
 // Memory access helpers - Hybrid Fast/Slow Path
 // Fast path: Direct RDRAM access (masked).
@@ -549,12 +675,21 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
-// FPU (COP1) operations
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
+// FPU (COP1) operations. Every arithmetic result saturates at +/-Fmax -- see
+// PS2_FPU_SAT near the top of this header for the semantics and the citation.
+#define FPU_ADD_S(a, b) PS2_FPU_SAT((float)(a) + (float)(b))
+#define FPU_SUB_S(a, b) PS2_FPU_SAT((float)(a) - (float)(b))
+#define FPU_MUL_S(a, b) PS2_FPU_SAT((float)(a) * (float)(b))
+#define FPU_DIV_S(a, b) PS2_FPU_SAT((float)(a) / (float)(b))
+// sqrt.s on the R5900 takes the magnitude of its operand: a negative input
+// sets the invalid flag and returns sqrt(|fs|), it does NOT return a NaN (the
+// COP1 has no NaN encoding at all). Plain sqrtf() hands back 0xFFC00000 for
+// any negative operand, which then contaminates every value derived from it.
+#ifdef PS2X_BISECT_NO_FLOAT_COND
 #define FPU_SQRT_S(a) sqrtf((float)(a))
+#else
+#define FPU_SQRT_S(a) sqrtf(fabsf((float)(a)))
+#endif
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
@@ -674,9 +809,16 @@ inline __m128i ps2_qfsrv(__m128i rs, __m128i rt, uint32_t sa)
 #define PS2_PEXEW(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(2, 3, 0, 1))
 #define PS2_PROT3W(rs) _mm_shuffle_epi32(rs, _MM_SHUFFLE(0, 3, 2, 1))
 
-// Additional VU0 operations
-#define PS2_VSQRT(x) sqrtf(x)
-#define PS2_VRSQRT(x) (1.0f / sqrtf(x))
+// Additional VU0 operations. VU SQRT takes the magnitude of its operand (it
+// cannot return a NaN -- there is no NaN encoding), and a zero radicand makes
+// RSQRT saturate rather than divide by zero. PCSX2 VUops.cpp _vuSQRT/_vuRSQRT.
+#ifdef PS2X_BISECT_NO_FLOAT_COND
+#define PS2_VSQRT(x) sqrtf((float)(x))
+#define PS2_VRSQRT(x) (1.0f / sqrtf((float)(x)))
+#else
+#define PS2_VSQRT(x) sqrtf(fabsf((float)(x)))
+#define PS2_VRSQRT(x) PS2_FPU_SAT(1.0f / sqrtf(fabsf((float)(x))))
+#endif
 
 #define GPR_U32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0U : static_cast<uint32_t>(PS2_EXTRACT_EPI32_0(ctx_ptr->r[reg_idx])))
 #define GPR_S32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0 : PS2_EXTRACT_EPI32_0(ctx_ptr->r[reg_idx]))

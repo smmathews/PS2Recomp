@@ -573,12 +573,24 @@ namespace ps2_stubs
 
         if (format_addr != 0)
         {
+            // Armed range comes from the runtime, not from a baked constant,
+            // so this probe cannot disagree with the path watch it shadows.
             const uint32_t watchBase = ps2PathWatchPhysAddr();
-            const uint32_t watchEnd = watchBase + PS2_PATH_WATCH_BYTES;
+            const uint32_t watchBytes = ps2PathWatchWatchBytes();
+            const uint32_t watchEnd = watchBase + watchBytes;
             const uint32_t dest = str_addr & PS2_RAM_MASK;
-            const bool touchesWatch = dest < watchEnd && dest >= watchBase;
+            const bool touchesWatch = watchBytes != 0u && dest < watchEnd && dest >= watchBase;
             static uint32_t watchSprintfLogCount = 0;
-            if (touchesWatch && watchSprintfLogCount < 64u)
+            static const uint32_t kMaxWatchSprintfLogs =
+                ps2DiagEnvLimit("PS2X_WATCH_SPRINTF_MAX_LOGS", 64u);
+            static std::atomic<bool> s_watchSprintfTruncated{false};
+            if (touchesWatch &&
+                ps2DiagLogBudget(std::cout,
+                                 "[watch:sprintf]",
+                                 "PS2X_WATCH_SPRINTF_MAX_LOGS",
+                                 kMaxWatchSprintfLogs,
+                                 watchSprintfLogCount,
+                                 s_watchSprintfTruncated))
             {
                 const uint32_t arg0 = getRegU32(ctx, 6);
                 const uint32_t arg1 = getRegU32(ctx, 7);

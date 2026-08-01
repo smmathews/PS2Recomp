@@ -21,8 +21,11 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <new>
 #include <stdexcept>
+#include <tuple>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // g_currentThreadId — -1 means this host thread is not currently running a fiber.
@@ -44,6 +47,7 @@ bool                    g_guest_token_held_by_host = false;
 // bool replaces the (typically lock-based) std::atomic<std::thread::id> owner id.
 static thread_local bool tls_holds_guest_token = false;
 std::atomic<bool>       g_stop{false};
+static std::atomic<int> g_host_token_waiters{0}; // host workers blocked in async_guest_begin()
 
 std::unordered_map<int, std::unique_ptr<FiberContext>> g_fiber_map;
 std::thread g_guest_thread;
@@ -192,18 +196,45 @@ static void guest_executor_main()
     tls_is_guest_thread = true;
 
     std::unique_lock<std::mutex> lk(g_sched_mutex);
+    // The wait predicate MUST be exactly (canQuit || canRun): an earlier
+    // version short-circuited on bare g_stop, so with g_stop set while
+    // (run_queue != null && waiters > 0) the predicate was instantly true but
+    // neither the break nor the pop condition held -- the loop continue'd,
+    // cv.wait saw the predicate already true and returned WITHOUT releasing
+    // g_sched_mutex, and the executor livelocked (spinning under the lock,
+    // also starving the very waiters it was gated on).
+    auto canQuit = []
+    {
+        return g_stop && g_run_queue == nullptr;
+    };
+    auto canRun = []
+    {
+        return g_run_queue != nullptr &&
+               g_running_fiber == nullptr &&
+               !g_guest_token_held_by_host &&
+               g_host_token_waiters.load(std::memory_order_relaxed) == 0;
+    };
     while (true)
     {
-        g_sched_cv.wait(lk, []
+        g_sched_cv.wait(lk, [&]
         {
-            return g_stop ||
-                   (g_run_queue != nullptr &&
-                    g_running_fiber == nullptr &&
-                    !g_guest_token_held_by_host);
+            return canQuit() || canRun();
         });
 
-        if (g_stop && g_run_queue == nullptr) break;
-        if (g_run_queue == nullptr || g_guest_token_held_by_host) continue; // re-wait
+        if (canQuit()) break;
+        if (!canRun()) continue; // spurious wake; predicate re-checked under lock
+        // NOTE on g_host_token_waiters gating: async_guest_begin()'s wakeup
+        // predicate is (g_running_fiber == nullptr && !token_held), but the only
+        // window where g_running_fiber is null is while THIS loop holds
+        // g_sched_mutex between resumes. Without this gate the executor's own
+        // cv.wait predicate is instantly true again (fiber re-enqueued by the
+        // post-resume code), so it re-resumes the fiber without ever sleeping,
+        // and a parked host worker (interrupt worker) can never win the token:
+        // guest spins waiting for VBlank ticks the starved worker can't deliver.
+        // Gating on waiters == 0 makes the executor genuinely sleep (releasing
+        // the mutex) until the host worker takes and releases the token. This is
+        // the executor-side half of the handoff whose fiber-side half is
+        // yield_point() step 4 (yield when a host worker is parked).
 
         FiberContext* fc = pop_head_locked();
         SCHED_REQUIRE(fc != nullptr, "executor popped null with non-empty predicate");
@@ -273,6 +304,7 @@ static void guest_executor_main()
             lk.unlock();
             ps2fiber_free(deadFiber);      // munmap outside the lock from a local
             // dead destructs here (FiberContext body) — fiber already freed above
+            lk.lock();                     // re-acquire before next wait or break
         }
         // else Fresh: impossible after a resume.
 
@@ -440,7 +472,10 @@ void ps2sched::create_fiber(int tid, int priority, uint32_t entry,
     }
 
     // The R5900Context constructor zeroes all registers and sets the documented
-    // reset defaults (cop0_random=47, vu0_q=1.0).
+    // reset defaults (cop0_random=47, vu0_q=1.0, vu0_vf[0]=(0,0,0,1) -- VF0 is
+    // hardwired on real VU hardware and every guest fiber needs it pinned or
+    // VU0-macro-mode skinning math silently collapses, see
+    // dq8/reference/dc2-learnings/04-vu-interpreter-correctness.md).
     auto fc = std::make_unique<FiberContext>();
     fc->tid      = tid;
     fc->priority = priority;
@@ -507,10 +542,19 @@ void ps2sched::join_fiber(int tid)
             done = (!t || t->finished.load(std::memory_order_acquire));
             if (!done && self && t)
             {
-                // Per-iteration floor: ensure self runs strictly AFTER the target
-                // (higher priority number == lower scheduling priority). The
-                // target's priority may change between iterations, so re-apply.
-                const int floor = t->priority + 1;
+                // Per-iteration floor: ensure the target gets CPU before self
+                // polls again. EQUAL priority (not target+1): the run queue is
+                // stable FIFO within a priority level, so when self re-enqueues
+                // on yield it lands BEHIND the queued target — the target still
+                // runs first. A floor of target+1 deadlocked by starvation
+                // (DQ8 M0, PS2_PROJECT_STATE §3.20): after the target fiber
+                // died, ANOTHER runnable fiber at the target's priority (a
+                // per-frame-woken worker) kept the queue non-empty at that
+                // level forever, so the joiner — parked one level BELOW — never
+                // ran again, never observed done, and never restored its
+                // priority: TerminateThread hung forever. The target's priority
+                // may change between iterations, so re-apply each pass.
+                const int floor = t->priority;
                 if (self->priority < floor)
                 {
                     if (!self->joinFloorActive)
@@ -866,19 +910,68 @@ void ps2sched::clear_suspend(int tid)
 // ---------------------------------------------------------------------------
 void ps2sched::rotate_ready_queue(int priority)
 {
-    std::lock_guard<std::mutex> lk(g_sched_mutex);
-    FiberContext** pp = &g_run_queue;
-    while (*pp && (*pp)->priority != priority)
-        pp = &(*pp)->next;
-    if (!*pp) return;
-    FiberContext* victim = *pp; // first node at this priority
-    *pp = victim->next;
-    victim->next = nullptr;
-    FiberContext** ins = pp; // re-insert after the last node at this priority
-    while (*ins && (*ins)->priority == priority)
-        ins = &(*ins)->next;
-    victim->next = *ins;
-    *ins = victim;
+    // The RUNNING fiber is not in g_run_queue (the executor pops it before
+    // resuming). On real hardware the running thread IS the head of its
+    // priority's ready queue, so RotateThreadReadyQueue(myPriority) moves the
+    // CALLER to the tail of its group and reschedules — that is the whole point
+    // of the syscall (a guest "yield to my equals" primitive; DQ8's fn_1a1050
+    // is an infinite `RotateThreadReadyQueue(prio); b .` loop).
+    //
+    // Rotating only the queued nodes, as this function used to do, never moves
+    // the caller, and the caller's maybe_yield() only preempts for a STRICTLY
+    // higher-priority fiber — so an equal-priority yield loop monopolised the
+    // N=1 cooperative CPU forever and starved every same-priority Ready fiber.
+    FiberContext* self = tls_current_fiber;
+    bool yieldSelf = false;
+    {
+        std::lock_guard<std::mutex> lk(g_sched_mutex);
+
+        if (self != nullptr && self->priority == priority)
+        {
+            // Caller is the head of this group. Only actually round-robin if
+            // somebody else can run at this priority or better; otherwise a
+            // requeue+switch would just resume us and burn fiber switches.
+            bool someoneElseRunnable = false;
+            for (FiberContext* n = g_run_queue; n != nullptr; n = n->next)
+            {
+                if (n->priority > priority) break; // queue is priority-ordered
+                if (n != self)
+                {
+                    someoneElseRunnable = true;
+                    break;
+                }
+            }
+            if (someoneElseRunnable)
+            {
+                enqueue_locked(self); // tail of our priority group, state=Ready
+                yieldSelf = true;
+            }
+            // The remaining same-priority nodes keep their relative order, which
+            // is exactly head->tail rotation with the caller as head.
+        }
+        else
+        {
+            // Rotating a group we are not part of: move that group's head node
+            // to the tail. No reschedule of the caller.
+            FiberContext** pp = &g_run_queue;
+            while (*pp && (*pp)->priority != priority)
+                pp = &(*pp)->next;
+            if (!*pp) return;
+            FiberContext* victim = *pp; // first node at this priority
+            *pp = victim->next;
+            victim->next = nullptr;
+            FiberContext** ins = pp; // re-insert after the last node at this priority
+            while (*ins && (*ins)->priority == priority)
+                ins = &(*ins)->next;
+            victim->next = *ins;
+            *ins = victim;
+        }
+    }
+
+    if (yieldSelf)
+    {
+        ps2fiber_yield(); // executor sees Ready+queued and reschedules us later
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +985,7 @@ void ps2sched::async_guest_begin()
                      "FATAL [ps2sched]: async_guest_begin from guest executor thread\n");
         std::terminate();
     }
+    g_host_token_waiters.fetch_add(1, std::memory_order_relaxed);
     std::unique_lock<std::mutex> lk(g_sched_mutex);
     g_sched_cv.wait(lk, []
     {
@@ -900,6 +994,7 @@ void ps2sched::async_guest_begin()
     g_guest_token_held_by_host = true;
     tls_holds_guest_token = true;
     // g_currentThreadId stays -1 on this host worker thread.
+    g_host_token_waiters.fetch_sub(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -961,7 +1056,81 @@ bool ps2sched::yield_point()
         }
     }
     if (yield) ps2fiber_yield();
+
+    // 4. If a host worker (interrupt worker) is parked waiting for the guest token,
+    // cooperatively yield so it can run VSync/INTC handlers.
+    if (fc && g_host_token_waiters.load(std::memory_order_relaxed) > 0) {
+        ps2fiber_yield();   // returns to executor; executor re-enqueues us (state=Running)
+        // After resuming, re-check terminate in case scheduler_shutdown() fired.
+        if (g_stop.load(std::memory_order_relaxed) &&
+            fc->terminateRequested.load(std::memory_order_relaxed))
+            throw ThreadExitException();
+        return true;
+    }
     return false;
+}
+
+// Diagnostic accessor for g_host_token_waiters.
+int ps2sched::host_token_waiters()
+{
+    return g_host_token_waiters.load(std::memory_order_relaxed);
+}
+
+// True only on the single guest executor thread. Mirrors the exact predicate
+// async_guest_begin() uses to abort -- lets shared dispatch helpers that may be
+// invoked either by a host worker (which must borrow the token) or, on some
+// call paths, synchronously from already-running guest code (which already
+// owns the execution slot) pick the correct behavior without duplicating that
+// invariant.
+bool ps2sched::is_guest_thread()
+{
+    return tls_is_guest_thread;
+}
+
+namespace
+{
+    const char *fiberStateName(FiberContext::State s)
+    {
+        switch (s)
+        {
+            case FiberContext::State::Fresh:    return "Fresh";
+            case FiberContext::State::Ready:    return "Ready";
+            case FiberContext::State::Running:  return "Running";
+            case FiberContext::State::Blocked:  return "Blocked";
+            case FiberContext::State::Exiting:  return "Exiting";
+            case FiberContext::State::Finished: return "Finished";
+        }
+        return "?";
+    }
+}
+
+// Diagnostic: dump every fiber's tid/priority/state/pc/ra. See ps2_scheduler.h.
+void ps2sched::dump_all_fibers(const char *reasonTag)
+{
+    std::vector<std::tuple<int,int,FiberContext::State,uint32_t,uint32_t>> rows;
+    {
+        std::lock_guard<std::mutex> lock(g_sched_mutex);
+        rows.reserve(g_fiber_map.size());
+        for (const auto &[tid, fc] : g_fiber_map)
+        {
+            if (!fc) continue;
+            const uint32_t pc = fc->cpu.pc;
+            const uint32_t ra = getRegU32(&fc->cpu, 31);
+            rows.emplace_back(tid, fc->priority, fc->state, pc, ra);
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto &a, const auto &b) { return std::get<0>(a) < std::get<0>(b); });
+    std::cout << "[dq8][fiberdump] reason=" << (reasonTag ? reasonTag : "?")
+              << " count=" << rows.size() << std::endl;
+    for (const auto &[tid, prio, state, pc, ra] : rows)
+    {
+        std::cout << "[dq8][fiberdump]   tid=" << tid
+                  << " prio=" << prio
+                  << " state=" << fiberStateName(state)
+                  << " pc=0x" << std::hex << pc
+                  << " ra=0x" << ra << std::dec
+                  << std::endl;
+    }
 }
 
 // Declared in ps2_fiber.h. Lets the fiber backend assert it only switches

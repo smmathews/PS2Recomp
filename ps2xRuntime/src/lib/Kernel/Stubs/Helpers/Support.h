@@ -1,6 +1,14 @@
 #include <algorithm>
 #include <cctype>
 
+// Declared in Kernel/Syscalls/Interrupt.h; forward-declared here so this
+// internal stubs helper does not need the Syscalls include graph (and so no
+// header visible to recompiled translation units changes).
+namespace ps2_syscalls
+{
+    void raisePendingIntc(uint32_t cause);
+}
+
 namespace
 {
     constexpr uint32_t kCdSectorSize = 2048;
@@ -1210,7 +1218,13 @@ namespace
     std::mutex g_dmaStubMutex;
     std::unordered_map<uint32_t, uint32_t> g_dmaPendingPolls;
     uint32_t g_dmaStubLogCount = 0;
-    constexpr uint32_t kMaxDmaStubLogs = 64;
+    constexpr uint32_t kMaxDmaStubLogsDefault = 64;
+    inline uint32_t dmaStubMaxLogs()
+    {
+        static const uint32_t limit = ps2DiagEnvLimit("PS2X_DMA_STUB_MAX_LOGS", kMaxDmaStubLogsDefault);
+        return limit;
+    }
+    inline std::atomic<bool> g_dmaStubLogTruncated{false};
 
     bool isKnownDmaChannelBase(uint32_t value)
     {
@@ -1354,9 +1368,26 @@ namespace
         mem.writeIORegister(channelBase + 0x00u, chcr);
         mem.processPendingTransfers();
 
+        // The transfer completed synchronously above. Raise the corresponding
+        // completion interrupt for asynchronous delivery on the irq worker's
+        // next tick (sce libdma registers the INTC/DMAC completion handler
+        // AFTER the kick returns, so a synchronous dispatch here would be
+        // lost). VIF1 kicks complete with INTC cause 5 (the packet's
+        // interrupt bit); other channels' completion is signalled through
+        // DMAC channel interrupts, which the runtime models elsewhere.
+        if (channelBase == 0x10009000u) // VIF1
+        {
+            ps2_syscalls::raisePendingIntc(5u);
+        }
+
         std::lock_guard<std::mutex> lock(g_dmaStubMutex);
         g_dmaPendingPolls[channelBase] = 1;
-        if (g_dmaStubLogCount < kMaxDmaStubLogs)
+        if (ps2DiagLogBudget(std::cout,
+                             "[sceDmaSend]",
+                             "PS2X_DMA_STUB_MAX_LOGS",
+                             dmaStubMaxLogs(),
+                             g_dmaStubLogCount,
+                             g_dmaStubLogTruncated))
         {
             RUNTIME_LOG("[sceDmaSend] ch=0x" << std::hex << channelBase
                       << " madr=0x" << madr
@@ -1823,11 +1854,38 @@ namespace
     {
         if (!runtime || !runtime->syncCoreSubsystems())
             return;
+
+        // Permanent low-noise display-pointer log: the DISPFB value chosen by
+        // the guest each time it applies a display environment is THE flip
+        // signal ("which buffer is front"). First 8 calls verbose, then every
+        // 600th (~10 s at one flip/frame). Pairs with the [gs-activity]
+        // drawFbp stat to diagnose draw-vs-display buffer mismatches.
+        {
+            static std::atomic<uint64_t> s_dispEnvCalls{0};
+            const uint64_t n = s_dispEnvCalls.fetch_add(1, std::memory_order_relaxed);
+            if (n < 8u || (n % 600u) == 0u)
+            {
+                std::cout << "[gs:dispenv] #" << n
+                          << std::hex
+                          << " dispfb=0x" << env.dispfb
+                          << " display=0x" << env.display
+                          << " pmode=0x" << env.pmode
+                          << std::dec << std::endl;
+            }
+        }
+
+        // Hardware-faithful: real libgraph sceGsPutDispEnv programs READ
+        // CIRCUIT 2 ONLY (PMODE, SMODE2, DISPFB2, DISPLAY2, BGCOLOR) from the
+        // one-circuit sceGsDispEnv struct. Circuit 1 is NOT part of the env:
+        // games that use both circuits (e.g. DQ8: PMODE=0x8007, EN1+EN2 with
+        // ALP=0x80 blend) program DISPFB1/DISPLAY1 themselves via direct GS
+        // privileged-register MMIO writes (DQ8: sub_00145690 at 0x1457e8
+        // writes DISPFB1 with DBY=1 = 0x80000009070). Writing both circuits
+        // here clobbered the guest's own circuit-1 state with the circuit-2
+        // buffer, forcing both circuits onto the same surface.
         auto &regs = runtime->memory().gs();
         regs.pmode = env.pmode;
         regs.smode2 = env.smode2;
-        regs.dispfb1 = env.dispfb;
-        regs.display1 = env.display;
         regs.dispfb2 = env.dispfb;
         regs.display2 = env.display;
         regs.bgcolor = env.bgcolor;

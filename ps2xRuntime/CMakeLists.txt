@@ -9,6 +9,16 @@ option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity bui
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 
+# recomp2 local patch: build libps2_runtime as a shared library so game
+# runners (dq8_runner) can link it dynamically — relinking a runner then
+# no longer re-links the whole runtime+raylib into the executable.
+# Implies PIC for everything in this tree, including the fetched raylib.
+option(PS2X_RUNTIME_SHARED "Build ps2_runtime as a shared library" OFF)
+if(PS2X_RUNTIME_SHARED)
+    # Must be set before raylib is fetched/configured so its objects are PIC.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
     if(PS2X_SCCACHE_PROGRAM)
@@ -161,7 +171,46 @@ else()
     target_link_libraries(ps2_host_backend INTERFACE raylib)
 endif()
 
-add_library(ps2_runtime STATIC
+# FMV decode blueprint Phase 1 (recomp2-local; ported from upstream PS2Recomp
+# #120 / commit 8c8a97a's non-WIN32 branch — that commit's WIN32 half fetches
+# a prebuilt DLL via ExternalProject and is intentionally NOT ported here,
+# since this tree only targets Linux). pkg-config-based FFmpeg discovery;
+# `ffmpeg` is an INTERFACE target linked into ps2_runtime below so the ported
+# MpegFfmpegDecoder (Kernel/Stubs/MpegFfmpegDecoder.cpp) can include
+# <libavcodec/avcodec.h> etc.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET GLOBAL
+    libavcodec
+    libavformat
+    libavutil
+    libswresample
+    libswscale
+)
+
+add_library(ffmpeg INTERFACE)
+target_link_libraries(ffmpeg INTERFACE PkgConfig::FFMPEG)
+
+# FMV decode blueprint Phase 2: standalone OFFLINE decode-validation binary.
+# Deliberately its own tiny executable (links only MpegFfmpegDecoder.cpp +
+# ffmpeg, NOT ps2_runtime/raylib) so it can be built/run without touching or
+# depending on the guest runtime boot path at all. See tools/mpeg_decode_test.cpp.
+add_executable(mpeg_decode_test
+    tools/mpeg_decode_test.cpp
+    src/lib/Kernel/Stubs/MpegFfmpegDecoder.cpp
+)
+target_link_libraries(mpeg_decode_test PRIVATE ffmpeg)
+target_include_directories(mpeg_decode_test PRIVATE
+    # recomp2-local: dq8/config/mvi_pad.h lives in the outer recomp2 tree,
+    # not inside this (nested) PS2Recomp repo/submodule.
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../dq8/config"
+)
+
+set(PS2X_RUNTIME_LIB_TYPE STATIC)
+if(PS2X_RUNTIME_SHARED AND NOT PS2X_IS_VITA)
+    set(PS2X_RUNTIME_LIB_TYPE SHARED)
+endif()
+
+add_library(ps2_runtime ${PS2X_RUNTIME_LIB_TYPE}
     src/lib/game_overrides.cpp
     src/lib/ps2_gif_arbiter.cpp
     src/lib/ps2_audio.cpp
@@ -175,6 +224,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_pad.cpp
     src/lib/ps2_runtime.cpp
     src/lib/ps2_scheduler.cpp
+    src/lib/ps2_vif0_interpreter.cpp
     src/lib/ps2_vif1_interpreter.cpp
     src/lib/ps2_vu1.cpp
     src/lib/games_database.cpp
@@ -238,7 +288,7 @@ target_include_directories(ps2_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib
 )
 
-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend)
+target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime

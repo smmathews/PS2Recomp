@@ -38,4 +38,18 @@ namespace ps2_syscalls
     // joins it. stopAlarmWorker() is called from notifyRuntimeStop().
     void ensureAlarmWorkerRunning();
     void stopAlarmWorker();
+    // Signal-only variant: sets the stop flag and wakes the worker but does
+    // NOT join. For callers on the guest executor thread (a fiber calling
+    // requestStop): joining there can deadlock against the alarm worker
+    // blocked in AsyncGuestScope/async_guest_begin(), whose wait predicate
+    // (g_running_fiber == nullptr) cannot become true while the joining fiber
+    // is itself the running fiber. The join happens later in
+    // scheduler_shutdown() on the main thread (stopAlarmWorker is idempotent).
+    void signalAlarmWorkerStop();
+
+    // Diagnostic: log every live semaphore's id/count/maxCount/waiters and the
+    // tids parked in its waitList. Pairs with ps2sched::dump_all_fibers() to
+    // answer "which wait-object is a Blocked fiber parked on" (task: parked
+    // pc/ra/wait-object per thread). Low-noise, permanent, call on demand.
+    void dumpSemaWaitLists(const char *reasonTag);
 }

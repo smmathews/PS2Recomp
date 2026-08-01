@@ -4,53 +4,16 @@
 
 namespace ps2_syscalls
 {
-    // --- DQ8 sid==15 actor-worker sema RCA probe (env DQ8_SEMA_PROBE) ---
-    // Tallies which path each Wait/Signal/Poll on sema id 15 takes and dumps a
-    // one-line summary at most every ~1s (driven from WaitSema). Zero cost when
-    // the env var is unset.
-    namespace {
-        inline bool semaProbeOn() {
-            static const bool on = (std::getenv("DQ8_SEMA_PROBE") != nullptr);
-            return on;
-        }
-        std::atomic<uint64_t> g_p_waitFast{0};     // WaitSema(15): count>0, immediate
-        std::atomic<uint64_t> g_p_waitBlock{0};    // WaitSema(15): count==0, fiber slow path (parked)
-        std::atomic<uint64_t> g_p_waitNonFiber{0}; // WaitSema(15): count==0, borrowed-worker path
-        std::atomic<uint64_t> g_p_waitBadSid{0};   // WaitSema(15): sema not found
-        std::atomic<uint64_t> g_p_sigOk{0};        // SignalSema(15): count incremented
-        std::atomic<uint64_t> g_p_sigOvf{0};       // SignalSema(15): at maxCount, overflow
-        std::atomic<uint64_t> g_p_pollOk{0};       // PollSema(15): consumed a permit
-        std::atomic<uint64_t> g_p_pollZero{0};     // PollSema(15): empty
-        std::atomic<int>      g_p_lastCount{-1};
-        std::atomic<int>      g_p_lastMax{-1};
-        void semaProbeMaybeDump(const char* tag) {
-            static std::atomic<uint64_t> s_epoch{0};
-            static thread_local std::chrono::steady_clock::time_point s_next{};
-            auto now = std::chrono::steady_clock::now();
-            if (now < s_next) return;
-            s_next = now + std::chrono::milliseconds(1000);
-            std::cerr << "[dq8][semaprobe:" << tag << "] "
-                      << "waitFast=" << g_p_waitFast.load()
-                      << " waitBlock=" << g_p_waitBlock.load()
-                      << " waitNonFiber=" << g_p_waitNonFiber.load()
-                      << " waitBadSid=" << g_p_waitBadSid.load()
-                      << " sigOk=" << g_p_sigOk.load()
-                      << " sigOvf=" << g_p_sigOvf.load()
-                      << " pollOk=" << g_p_pollOk.load()
-                      << " pollZero=" << g_p_pollZero.load()
-                      << " lastCount=" << g_p_lastCount.load()
-                      << " lastMax=" << g_p_lastMax.load()
-                      << std::endl;
-        }
-    }
-
-    // --- DQ8 M-F1 sndstrm voice-wake targeted probe (env DQ8_SEMA_PROBE,
-    // default target sid 0x19 -- override with DQ8_SEMA_PROBE_SID). Ported
-    // from Sync.cpp.head-plus-sid0x19-probe-PRESERVE onto this WIP base per
-    // the sndstrm-voicewake-fix-spec; logs every CreateSema/PollSema/
-    // SignalSema/WaitSema call against ONE target sid directly (it fires
-    // rarely, so no tally/rate-limit is needed). Independent of the sid==15
-    // probe above -- do not merge, different target/format. ---
+    // --- DQ8 M-F1 sndstrm voice-wake sema RCA probe (THROWAWAY, env
+    // DQ8_SEMA_PROBE gates it on; default target sid 0x19 -- the sndstrm
+    // voice-worker's wake sema -- override with DQ8_SEMA_PROBE_SID). Logs
+    // every CreateSema/PollSema/SignalSema/WaitSema call against ONE target
+    // sid directly (it fires rarely -- a handful of calls per run -- so no
+    // tally/rate-limit is needed). Built on top of git HEAD's Sync.cpp
+    // (isolated from an unrelated, unstable in-progress local edit to this
+    // same file discovered concurrently -- see the M-F1 voicewake blueprint
+    // and Sync.cpp.concurrent-wip-backup-20260725 in this directory, which
+    // preserves that other, uncommitted work byte-for-byte). ---
     namespace {
         inline bool dq8SemaProbeOn() {
             static const bool on = (std::getenv("DQ8_SEMA_PROBE") != nullptr);
@@ -110,14 +73,13 @@ namespace ps2_syscalls
             return out;
         }
 
-        // EE layout (ps2 sdk ee_sema_t):
-        // [0]=attr [1]=initCount [2]=maxCount [3]=waitThreads
-        // (maxCount=0 means no limit; the caller below clamps it to 1)
+        // EE layout (kernel.h):
+        // [0]=count [1]=max_count [2]=init_count [3]=wait_threads [4]=attr [5]=option
         const bool hasEeLayout = availableWords >= 3u;
-        const int eeInit = hasEeLayout ? static_cast<int>(param[1]) : 0;
-        const int eeMax  = hasEeLayout ? static_cast<int>(param[2]) : 1;
-        const uint32_t eeAttr   = (availableWords >= 1u) ? param[0] : 0u;
-        const uint32_t eeOption = (availableWords >= 4u) ? param[3] : 0u;
+        const int eeMax = hasEeLayout ? static_cast<int>(param[1]) : 1;
+        const int eeInit = hasEeLayout ? static_cast<int>(param[2]) : 0;
+        const uint32_t eeAttr = (availableWords >= 5u) ? param[4] : 0u;
+        const uint32_t eeOption = (availableWords >= 6u) ? param[5] : 0u;
 
         // Legacy layout (IOP-style):
         // [0]=attr [1]=option [2]=init [3]=max
@@ -133,12 +95,8 @@ namespace ps2_syscalls
         };
 
         bool useLegacyLayout = hasLegacyLayout && !hasEeLayout;
-        if (hasLegacyLayout && hasEeLayout && countLooksPlausible(legacyMax) && !countLooksPlausible(eeMax)
-            && !countLooksPlausible(eeInit))
+        if (hasLegacyLayout && hasEeLayout && countLooksPlausible(legacyMax) && !countLooksPlausible(eeMax))
         {
-            // Only prefer legacy when BOTH EE count fields are implausible.
-            // If eeInit looks valid (e.g. 1), the EE layout is correct and maxCount=0
-            // just means "no upper bound" (clamped to 1 below).
             useLegacyLayout = true;
         }
         else if (hasLegacyLayout && hasEeLayout && countLooksPlausible(legacyMax) && countLooksPlausible(eeMax))
@@ -306,8 +264,7 @@ namespace ps2_syscalls
             ps2sched::maybe_yield();
         }
 
-        // Real PS2 EE BIOS returns sid on success, not KE_OK.
-        setReturnS32(ctx, sid);
+        setReturnS32(ctx, KE_OK);
     }
 
     void iDeleteSema(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -325,8 +282,7 @@ namespace ps2_syscalls
             return;
         }
 
-        // Real PS2 EE BIOS returns sid on success, not KE_OK.
-        int ret = sid;
+        int ret = KE_OK;
         int beforeCount = 0;
         int afterCount = 0;
         int wokenTid = 0;
@@ -334,31 +290,20 @@ namespace ps2_syscalls
         {
             std::unique_lock<std::mutex> lock(sema->m);
             beforeCount = sema->count;
-            if (!sema->waitList.empty())
-            {
-                // Hand off directly to the oldest waiter instead of going
-                // through the general-purpose count. If this instead did
-                // count++ (still bounded/visible via sema->count), a second
-                // Poll/WaitSema call from a DIFFERENT thread that runs
-                // before the woken waiter is actually scheduled (guaranteed
-                // under this cooperative single-runner fiber scheduler, not
-                // just possible) can steal the permit right back out before
-                // the waiter resumes -- see reservedGrants in
-                // Helpers/State.h. maxCount does not bound a direct
-                // hand-off (matches real hardware: the max-count only caps
-                // the free-standing count, not an active transfer).
-                wokenTid   = sema->waitList.front().first;
-                wokenToken = sema->waitList.front().second;
-                sema->waitList.erase(sema->waitList.begin());
-                sema->reservedGrants++;
-            }
-            else if (sema->count >= sema->maxCount)
+            if (sema->count >= sema->maxCount)
             {
                 ret = KE_SEMA_OVF;
             }
             else
             {
                 sema->count++;
+                // Pop one waiter and wake it.
+                if (!sema->waitList.empty())
+                {
+                    wokenTid   = sema->waitList.front().first;
+                    wokenToken = sema->waitList.front().second;
+                    sema->waitList.erase(sema->waitList.begin());
+                }
             }
             afterCount = sema->count;
             lock.unlock();
@@ -367,14 +312,6 @@ namespace ps2_syscalls
         {
             ps2sched::enqueue_external_wakeup_validated(wokenTid, wokenToken);
             ps2sched::maybe_yield();
-        }
-
-        if (semaProbeOn() && sid == 15)
-        {
-            g_p_lastCount.store(afterCount);
-            g_p_lastMax.store(sema->maxCount);
-            if (ret == KE_SEMA_OVF) g_p_sigOvf.fetch_add(1);
-            else g_p_sigOk.fetch_add(1);
         }
 
         static std::atomic<uint32_t> s_signalSemaLogs{0};
@@ -410,11 +347,6 @@ namespace ps2_syscalls
         auto sema = lookupSemaInfo(sid);
         if (!sema)
         {
-            if (semaProbeOn() && sid == 15)
-            {
-                g_p_waitBadSid.fetch_add(1);
-                semaProbeMaybeDump("wait-badsid");
-            }
             setReturnS32(ctx, KE_UNKNOWN_SEMID);
             return;
         }
@@ -429,18 +361,7 @@ namespace ps2_syscalls
             onFiber ? ensureCurrentThreadInfo(ctx) : nullptr;
         throwIfTerminated(info); // throwIfTerminated is null-safe
         std::unique_lock<std::mutex> lock(sema->m);
-        // Real PS2 EE BIOS returns sid on success, not 0.
-        int ret = sid;
-
-        if (semaProbeOn() && sid == 15)
-        {
-            g_p_lastCount.store(sema->count);
-            g_p_lastMax.store(sema->maxCount);
-            if (sema->count > 0) g_p_waitFast.fetch_add(1);
-            else if (onFiber)    g_p_waitBlock.fetch_add(1);
-            else                 g_p_waitNonFiber.fetch_add(1);
-            semaProbeMaybeDump("wait");
-        }
+        int ret = 0;
 
         if (dq8SemaProbeOn() && sid == dq8SemaProbeTarget())
         {
@@ -570,21 +491,8 @@ namespace ps2_syscalls
                 }
 
                 // Mesa re-check: only consume if a permit is actually available.
-                // reservedGrants first -- SignalSema hands these off directly to
-                // a specific dequeued waiter (this thread, if it's the one that
-                // was woken for that reason) and nothing else can consume them,
-                // so this check can never be starved by an unrelated PollSema.
-                // Falls back to the general-purpose count for any other reason
-                // this thread might have woken (e.g. a stale wake racing a
-                // second, count-based SignalSema). If PollSema stole the count
-                // between SignalSema's unlock and our re-lock, count == 0 and we
-                // loop to re-block.
-                if (sema->reservedGrants > 0)
-                {
-                    sema->reservedGrants--;
-                    ret = 0;
-                    break;
-                }
+                // If PollSema stole the count between SignalSema's unlock and our
+                // re-lock, count == 0 and we loop to re-block.
                 if (sema->count > 0)
                 {
                     sema->count--;
@@ -641,7 +549,6 @@ namespace ps2_syscalls
         {
             const int dq8CountBefore = sema->count;
             sema->count--;
-            if (semaProbeOn() && sid == 15) { g_p_pollOk.fetch_add(1); g_p_lastCount.store(sema->count); g_p_lastMax.store(sema->maxCount); }
             if (dq8SemaProbeOn() && sid == dq8SemaProbeTarget())
             {
                 std::cerr << "[dq8][sema19probe] PollSema tid=" << g_currentThreadId
@@ -650,12 +557,10 @@ namespace ps2_syscalls
                            << " ra=0x" << std::hex << getRegU32(ctx, 31) << std::dec
                            << std::endl;
             }
-            // Real PS2 EE BIOS returns sid on success, not KE_OK.
-            setReturnS32(ctx, sid);
+            setReturnS32(ctx, KE_OK);
             return;
         }
 
-        if (semaProbeOn() && sid == 15) { g_p_pollZero.fetch_add(1); g_p_lastCount.store(sema->count); g_p_lastMax.store(sema->maxCount); }
         if (dq8SemaProbeOn() && sid == dq8SemaProbeTarget())
         {
             std::cerr << "[dq8][sema19probe] PollSema tid=" << g_currentThreadId
@@ -1224,11 +1129,9 @@ namespace ps2_syscalls
 
                 R5900Context callbackCtx{};
                 setRegU32(&callbackCtx, 28, readyAlarm->gp);
-                // Failure fallback: top of the kernel-area callback pool,
-                // not PS2_RAM_SIZE-0x10 (inside the guest's own main stack).
                 setRegU32(&callbackCtx, 29,
                           (s_alarmStackTop != 0u) ? s_alarmStackTop
-                                                  : (0x00100000u - 0x10u));
+                                                  : (PS2_RAM_SIZE - 0x10u));
                 setRegU32(&callbackCtx, 31, 0);
                 setRegU32(&callbackCtx, 4, static_cast<uint32_t>(readyAlarm->id));
                 setRegU32(&callbackCtx, 5, static_cast<uint32_t>(readyAlarm->ticks));
@@ -1278,6 +1181,13 @@ namespace ps2_syscalls
             g_alarm_thread.join(); // wait for the worker to fully exit
     }
 
+    // Restored verbatim from a concurrent (uncommitted, unrelated) in-progress
+    // edit to this file discovered mid-session -- see
+    // Sync.cpp.concurrent-wip-backup-20260725 and Sync.h, which already
+    // declares this and still gets called from Lifecycle.cpp. Non-joining
+    // variant of stopAlarmWorker(): signals the alarm worker to stop without
+    // blocking the caller; scheduler_shutdown()'s stopAlarmWorker() does the
+    // actual join.
     void signalAlarmWorkerStop()
     {
         if (!g_alarm_worker_started.load(std::memory_order_acquire))
@@ -1294,15 +1204,7 @@ namespace ps2_syscalls
         uint32_t arg = getRegU32(ctx, 6);
 
         static int logCount = 0;
-        static const uint32_t kMaxSetAlarmLogs =
-            ps2DiagEnvLimit("PS2X_SETALARM_MAX_LOGS", 5u);
-        static std::atomic<bool> s_setAlarmTruncated{false};
-        if (ps2DiagLogBudget(std::cout,
-                             "[SetAlarm]",
-                             "PS2X_SETALARM_MAX_LOGS",
-                             kMaxSetAlarmLogs,
-                             static_cast<uint32_t>(logCount),
-                             s_setAlarmTruncated))
+        if (logCount < 5)
         {
             RUNTIME_LOG("[SetAlarm] ticks=" << ticks
                                             << " handler=0x" << std::hex << handler
@@ -1393,10 +1295,13 @@ namespace ps2_syscalls
         iCancelAlarm(rdram, ctx, runtime);
     }
 
-    // Diagnostic: dump every live sema's id/count/maxCount/waiters + parked
-    // tids. See Sync.h. Snapshots under g_sema_map_mutex, then logs outside
-    // the lock (matches the sema->waitList swap-then-log pattern used
-    // elsewhere in this file, e.g. DeleteSema above).
+    // Restored verbatim from a concurrent (uncommitted, unrelated) in-progress
+    // edit to this file discovered mid-session -- see
+    // Sync.cpp.concurrent-wip-backup-20260725 and Sync.h, which already
+    // declares this and still gets called from ps2_runtime.cpp's 30s/90s
+    // one-shot diagnostic dumps. Diagnostic: dump every live sema's
+    // id/count/maxCount/waiters + parked tids. Snapshots under
+    // g_sema_map_mutex, then logs outside the lock.
     void dumpSemaWaitLists(const char *reasonTag)
     {
         struct Row
@@ -1405,7 +1310,6 @@ namespace ps2_syscalls
             int count;
             int maxCount;
             int waiters;
-            int reservedGrants;
             std::vector<int> waitingTids;
         };
         std::vector<Row> rows;
@@ -1415,13 +1319,12 @@ namespace ps2_syscalls
             for (const auto &[id, info] : g_semas)
             {
                 if (!info) continue;
-                Row row{id, 0, 0, 0, 0, {}};
+                Row row{id, 0, 0, 0, {}};
                 {
                     std::lock_guard<std::mutex> semaLock(info->m);
                     row.count = info->count;
                     row.maxCount = info->maxCount;
                     row.waiters = info->waiters;
-                    row.reservedGrants = info->reservedGrants;
                     row.waitingTids.reserve(info->waitList.size());
                     for (const auto &[tid, token] : info->waitList)
                     {
@@ -1441,7 +1344,6 @@ namespace ps2_syscalls
                       << " count=" << row.count
                       << " max=" << row.maxCount
                       << " waiters=" << row.waiters
-                      << " reservedGrants=" << row.reservedGrants
                       << " waitingTids=[";
             for (size_t i = 0; i < row.waitingTids.size(); ++i)
             {

@@ -39,9 +39,22 @@ namespace ps2_syscalls
     }
 
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
+    // Record a level-triggered INTC event (e.g. VIF1 DMA completion -> cause
+    // 5) for asynchronous delivery by the irq worker on its next tick. Must
+    // NOT dispatch synchronously at the raise site: the sce libdma protocol
+    // registers/enables the completion handler AFTER the kick returns.
+    void raisePendingIntc(uint32_t cause);
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     void stopInterruptWorker();
+    // Signal-only variant: sets the stop flag and wakes the worker but does
+    // NOT join. For callers on the guest executor thread (a fiber calling
+    // requestStop): joining there can deadlock against a worker blocked in
+    // async_guest_begin(), whose wait predicate (g_running_fiber == nullptr)
+    // cannot become true while the joining fiber is itself the running fiber.
+    // The join happens later in scheduler_shutdown() on the main thread
+    // (stopInterruptWorker is idempotent).
+    void signalInterruptWorkerStop();
     uint64_t WaitForNextVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void WaitVSyncTick(uint8_t *rdram, PS2Runtime *runtime);
     void SetVSyncFlag(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);

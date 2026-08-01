@@ -93,6 +93,7 @@ namespace ps2_syscalls
             setReturnS32(ctx, -1);
             return;
         }
+        std::cerr << "[fioOpen] ps2='" << ps2Path << "' host='" << hostPath << "'" << std::endl;
 
         const char *mode = translateFioMode(flags);
         RUNTIME_LOG("fioOpen: '" << hostPath << "' flags=0x" << std::hex << flags << std::dec << " mode='" << mode << "'");
@@ -196,6 +197,7 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(g_sys_fd_mutex);
             bytesRead = fread(hostBuf, 1, size, fp);
         }
+        std::cerr << "[fioRead] fd=" << ps2Fd << " req=" << size << " got=" << bytesRead << std::endl;
 
         if (bytesRead < size && ferror(fp))
         {

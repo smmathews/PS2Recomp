@@ -25,6 +25,19 @@ namespace ps2_syscalls
         uint32_t g_enabled_dmac_mask = 0xFFFFFFFFu;
         uint64_t g_vsync_tick_counter = 0u;
         VSyncFlagRegistration g_vsync_registration{};
+
+        // Level-triggered pending INTC causes raised by completed DMA
+        // transfers (e.g. VIF1 kick -> INTC cause 5). Delivered by the irq
+        // worker on its next tick — NOT synchronously at the raise site,
+        // because the sce libdma protocol registers/enables the completion
+        // handler AFTER the kick returns (kick; CreateSema; AddIntcHandler;
+        // EnableIntc; wait) — a synchronous dispatch would fire before the
+        // handler exists and be lost. A pending bit stays set until a
+        // dispatch actually ran >= 1 handler for the cause (or it ages out),
+        // covering the raise-vs-register race in the other direction too.
+        std::atomic<uint32_t> g_pending_intc_causes{0u};
+        uint32_t g_pending_intc_age[32] = {};
+        constexpr uint32_t kPendingIntcMaxAgeTicks = 120u; // ~2 s @60 Hz
     }
 
     using namespace interrupt_state;
@@ -80,12 +93,18 @@ namespace ps2_syscalls
     static uint32_t getAsyncHandlerStackTop(PS2Runtime *runtime)
     {
         constexpr uint32_t kAsyncHandlerStackSize = 0x4000u;
+        // Failure fallback: top of the kernel-area callback pool, NOT
+        // PS2_RAM_SIZE-0x10 -- that address is inside the guest's own main
+        // stack (DQ8 SetupThread: [0x01F40000, 0x02000000)) and running a
+        // handler there corrupts live guest frames. Only reachable if the
+        // 512 KB pool is exhausted (32 x 16 KB) or runtime is null.
+        constexpr uint32_t kFallbackStackTop = 0x00100000u - 0x10u;
         thread_local PS2Runtime *s_cachedRuntime = nullptr;
         thread_local uint32_t s_cachedStackTop = 0u;
 
         if (runtime == nullptr)
         {
-            return PS2_RAM_SIZE - 0x10u;
+            return kFallbackStackTop;
         }
 
         if (s_cachedRuntime != runtime || s_cachedStackTop == 0u)
@@ -94,14 +113,16 @@ namespace ps2_syscalls
             s_cachedStackTop = runtime->reserveAsyncCallbackStack(kAsyncHandlerStackSize, 16u);
         }
 
-        return (s_cachedStackTop != 0u) ? s_cachedStackTop : (PS2_RAM_SIZE - 0x10u);
+        return (s_cachedStackTop != 0u) ? s_cachedStackTop : kFallbackStackTop;
     }
 
-    static void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
+    // Returns the number of handlers actually dispatched (0 when the cause is
+    // masked, no handler is registered, or a handler body is unavailable).
+    static int dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
         if (!rdram || !runtime)
         {
-            return;
+            return 0;
         }
 
         std::vector<IrqHandlerInfo> handlers;
@@ -109,7 +130,7 @@ namespace ps2_syscalls
             std::lock_guard<std::mutex> lock(g_irq_handler_mutex);
             if (cause < 32u && (g_enabled_intc_mask & (1u << cause)) == 0u)
             {
-                return;
+                return 0;
             }
 
             handlers.reserve(g_intcHandlers.size());
@@ -134,6 +155,7 @@ namespace ps2_syscalls
                       { return a.order < b.order; });
         }
 
+        int dispatched = 0;
         AsyncGuestScope guestScope; // token released on any exit path
         for (const IrqHandlerInfo &info : handlers)
         {
@@ -143,8 +165,16 @@ namespace ps2_syscalls
                 {
                     PS2_IF_AGRESSIVE_LOGS({
                         static std::atomic<uint32_t> s_missingHandlerLogCount{0u};
+                        static const uint32_t kMaxMissingHandlerLogs =
+                            ps2DiagEnvLimit("PS2X_INTC_MISSING_MAX_LOGS", 32u);
+                        static std::atomic<bool> s_missingHandlerTruncated{false};
                         const uint32_t logIndex = s_missingHandlerLogCount.fetch_add(1u, std::memory_order_relaxed);
-                        if (logIndex < 32u)
+                        if (ps2DiagLogBudget(std::cout,
+                                             "[INTC:missing]",
+                                             "PS2X_INTC_MISSING_MAX_LOGS",
+                                             kMaxMissingHandlerLogs,
+                                             logIndex,
+                                             s_missingHandlerTruncated))
                         {
                             auto flags = std::cout.flags();
                             std::cout << "[INTC:missing] cause=" << cause
@@ -171,6 +201,7 @@ namespace ps2_syscalls
                 SET_GPR_U32(&irqCtx, 7, 0u);
                 irqCtx.pc = info.handler;
 
+                ++dispatched;
                 while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested())
                 {
                     PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
@@ -194,6 +225,71 @@ namespace ps2_syscalls
                     std::cerr << "[INTC] handler 0x" << std::hex << info.handler
                               << " threw exception: " << e.what() << std::dec << std::endl;
                     ++warnCount;
+                }
+            }
+        }
+        return dispatched;
+    }
+
+    // Record a level-triggered INTC event for asynchronous delivery by the
+    // irq worker (next tick, <= one vblank of latency — hardware-plausible
+    // DMA-completion timing). See g_pending_intc_causes for why delivery must
+    // not be synchronous with the raise site. Safe from any thread.
+    void raisePendingIntc(uint32_t cause)
+    {
+        if (cause >= 32u || cause == kIntcVblankStart || cause == kIntcVblankEnd)
+        {
+            return; // vblank causes are the worker's own periodic dispatches
+        }
+        const uint32_t bit = 1u << cause;
+        const uint32_t prev = g_pending_intc_causes.fetch_or(bit, std::memory_order_acq_rel);
+        if ((prev & bit) == 0u)
+        {
+            static std::atomic<uint32_t> s_raiseLog{0u};
+            const uint32_t n = s_raiseLog.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 16u || (n % 256u) == 0u)
+            {
+                std::cout << "[INTC:raise] cause=" << cause << " (pending, n=" << n << ")" << std::endl;
+            }
+        }
+    }
+
+    // Drain pending non-vblank INTC causes (called from the irq worker each
+    // tick). A cause stays pending until >= 1 handler actually ran, or it
+    // ages out (raise-vs-AddIntcHandler registration race coverage).
+    static void drainPendingIntc(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        uint32_t pending = g_pending_intc_causes.load(std::memory_order_acquire);
+        while (pending != 0u)
+        {
+            const uint32_t cause = static_cast<uint32_t>(__builtin_ctz(pending));
+            const uint32_t bit = 1u << cause;
+            pending &= ~bit;
+
+            const int ran = dispatchIntcHandlersForCause(rdram, runtime, cause);
+            if (ran > 0)
+            {
+                g_pending_intc_causes.fetch_and(~bit, std::memory_order_acq_rel);
+                g_pending_intc_age[cause] = 0u;
+                static std::atomic<uint32_t> s_deliverLog{0u};
+                const uint32_t n = s_deliverLog.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 16u || (n % 256u) == 0u)
+                {
+                    std::cout << "[INTC:deliver] cause=" << cause
+                              << " handlers=" << ran << " (n=" << n << ")" << std::endl;
+                }
+            }
+            else if (++g_pending_intc_age[cause] > kPendingIntcMaxAgeTicks)
+            {
+                g_pending_intc_causes.fetch_and(~bit, std::memory_order_acq_rel);
+                g_pending_intc_age[cause] = 0u;
+                static std::atomic<uint32_t> s_dropLog{0u};
+                const uint32_t n = s_dropLog.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 8u || (n % 64u) == 0u)
+                {
+                    std::cout << "[INTC:drop] cause=" << cause
+                              << " aged out with no registered/enabled handler (n="
+                              << n << ")" << std::endl;
                 }
             }
         }
@@ -236,49 +332,69 @@ namespace ps2_syscalls
                       { return a.order < b.order; });
         }
 
-        AsyncGuestScope guestScope; // token released on any exit path
-        for (const IrqHandlerInfo &info : handlers)
+        auto runHandlers = [&]()
         {
-            if (!runtime->hasFunction(info.handler))
+            for (const IrqHandlerInfo &info : handlers)
             {
-                continue;
-            }
-
-            try
-            {
-                R5900Context irqCtx{};
-                SET_GPR_U32(&irqCtx, 28, info.gp);
-                SET_GPR_U32(&irqCtx, 29, getAsyncHandlerStackTop(runtime));
-                SET_GPR_U32(&irqCtx, 31, 0u);
-                SET_GPR_U32(&irqCtx, 4, cause);
-                SET_GPR_U32(&irqCtx, 5, info.arg);
-                SET_GPR_U32(&irqCtx, 6, 0u);
-                SET_GPR_U32(&irqCtx, 7, 0u);
-                irqCtx.pc = info.handler;
-
-                while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested())
+                if (!runtime->hasFunction(info.handler))
                 {
-                    PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
-                    if (!step)
+                    continue;
+                }
+
+                try
+                {
+                    R5900Context irqCtx{};
+                    SET_GPR_U32(&irqCtx, 28, info.gp);
+                    SET_GPR_U32(&irqCtx, 29, getAsyncHandlerStackTop(runtime));
+                    SET_GPR_U32(&irqCtx, 31, 0u);
+                    SET_GPR_U32(&irqCtx, 4, cause);
+                    SET_GPR_U32(&irqCtx, 5, info.arg);
+                    SET_GPR_U32(&irqCtx, 6, 0u);
+                    SET_GPR_U32(&irqCtx, 7, 0u);
+                    irqCtx.pc = info.handler;
+
+                    while (irqCtx.pc != 0u && runtime && !runtime->isStopRequested())
                     {
-                        break;
+                        PS2Runtime::RecompiledFunction step = runtime->lookupFunction(irqCtx.pc);
+                        if (!step)
+                        {
+                            break;
+                        }
+                        step(rdram, &irqCtx, runtime);
                     }
-                    step(rdram, &irqCtx, runtime);
                 }
-            }
-            catch (const ThreadExitException &)
-            {
-            }
-            catch (const std::exception &e)
-            {
-                static uint32_t warnCount = 0;
-                if (warnCount < 8u)
+                catch (const ThreadExitException &)
                 {
-                    std::cerr << "[DMAC] handler 0x" << std::hex << info.handler
-                              << " threw exception: " << e.what() << std::dec << std::endl;
-                    ++warnCount;
+                }
+                catch (const std::exception &e)
+                {
+                    static uint32_t warnCount = 0;
+                    if (warnCount < 8u)
+                    {
+                        std::cerr << "[DMAC] handler 0x" << std::hex << info.handler
+                                  << " threw exception: " << e.what() << std::dec << std::endl;
+                        ++warnCount;
+                    }
                 }
             }
+        };
+
+        // Unlike dispatchIntcHandlersForCause (only ever called from the IRQ
+        // worker host thread), this function is also reachable synchronously
+        // from guest code: sceSifSetDma (Stubs/SIF.cpp) calls it inline while
+        // servicing a guest syscall, i.e. while the calling fiber IS the guest
+        // execution slot. AsyncGuestScope's async_guest_begin() aborts by
+        // design if invoked from the guest executor thread (that guard exists
+        // to catch host workers mistakenly running there) -- so only borrow
+        // the token when this call is NOT already running on the guest thread.
+        if (ps2sched::is_guest_thread())
+        {
+            runHandlers();
+        }
+        else
+        {
+            AsyncGuestScope guestScope; // token released on any exit path
+            runHandlers();
         }
     }
 
@@ -320,9 +436,29 @@ namespace ps2_syscalls
     static void interruptWorkerMain(uint8_t *rdram, PS2Runtime *runtime)
     {
         g_currentThreadId = -1;
+        std::cerr << "[irq-worker] interrupt worker started\n";
 
         using clock = std::chrono::steady_clock;
+        const auto workerStart = clock::now();
         auto nextTick = clock::now() + kVblankPeriod;
+        uint64_t totalTicks = 0u; // all VBlank ticks processed (incl. catch-up)
+
+        // Cheap tick-health summary: the per-tick cadence log (n<3 || n%60==0)
+        // only bounds wakeups, it does not prove sustained 60Hz delivery.
+        // Log total ticks + wall time + effective Hz every 600 ticks (~10 s)
+        // and once on worker exit.
+        auto logTickSummary = [&](const char *tag)
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     clock::now() - workerStart)
+                                     .count();
+            const double seconds = static_cast<double>(elapsed) / 1000.0;
+            const double hz = (seconds > 0.0) ? (static_cast<double>(totalTicks) / seconds) : 0.0;
+            std::cerr << "[irq-worker] " << tag
+                      << " ticks=" << totalTicks
+                      << " elapsed=" << seconds << "s"
+                      << " rate=" << hz << "Hz\n";
+        };
 
         while (runtime != nullptr && !runtime->isStopRequested())
         {
@@ -347,6 +483,14 @@ namespace ps2_syscalls
                 continue;
             }
 
+            {
+                static std::atomic<uint32_t> s_tickLog{0};
+                uint32_t n = s_tickLog.fetch_add(1, std::memory_order_relaxed);
+                if (n < 3u || (n % 60u) == 0u)
+                    std::cerr << "[irq-worker] tick #" << n
+                              << " waiters=" << ps2sched::host_token_waiters()
+                              << "\n";
+            }
             for (int i = 0; i < ticksToProcess; ++i)
             {
                 const uint64_t tickValue = signalVSyncFlag(rdram);
@@ -354,9 +498,20 @@ namespace ps2_syscalls
                 dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
                 dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankEnd);
+                // Deferred DMA-completion interrupts (e.g. VIF1 -> cause 5),
+                // raised by submitDmaSend and delivered here one tick later.
+                drainPendingIntc(rdram, runtime);
+            }
+
+            const uint64_t before = totalTicks;
+            totalTicks += static_cast<uint64_t>(ticksToProcess);
+            if ((before / 600u) != (totalTicks / 600u))
+            {
+                logTickSummary("tick-summary");
             }
         }
 
+        logTickSummary("exit-summary");
         g_irq_worker_running.store(false, std::memory_order_release);
         g_irq_worker_cv.notify_all();
     }
@@ -401,6 +556,12 @@ namespace ps2_syscalls
     {
         std::lock_guard<std::mutex> lock(g_vsync_flag_mutex);
         return g_vsync_tick_counter;
+    }
+
+    void signalInterruptWorkerStop()
+    {
+        g_irq_worker_stop.store(true, std::memory_order_release);
+        g_irq_worker_cv.notify_all();
     }
 
     void stopInterruptWorker()
@@ -550,8 +711,16 @@ namespace ps2_syscalls
         {
             PS2_IF_AGRESSIVE_LOGS({
                 static std::atomic<uint32_t> s_enableLogCount{0u};
+                static const uint32_t kMaxEnableLogs =
+                    ps2DiagEnvLimit("PS2X_INTC_ENABLE_MAX_LOGS", 32u);
+                static std::atomic<bool> s_enableTruncated{false};
                 const uint32_t logIndex = s_enableLogCount.fetch_add(1u, std::memory_order_relaxed);
-                if (logIndex < 32u)
+                if (ps2DiagLogBudget(std::cout,
+                                     "[EnableIntc]",
+                                     "PS2X_INTC_ENABLE_MAX_LOGS",
+                                     kMaxEnableLogs,
+                                     logIndex,
+                                     s_enableTruncated))
                 {
                     RUNTIME_LOG("[EnableIntc] cause=" << cause);
                 }
@@ -577,8 +746,16 @@ namespace ps2_syscalls
         {
             PS2_IF_AGRESSIVE_LOGS({
                 static std::atomic<uint32_t> s_disableLogCount{0u};
+                static const uint32_t kMaxDisableLogs =
+                    ps2DiagEnvLimit("PS2X_INTC_DISABLE_MAX_LOGS", 32u);
+                static std::atomic<bool> s_disableTruncated{false};
                 const uint32_t logIndex = s_disableLogCount.fetch_add(1u, std::memory_order_relaxed);
-                if (logIndex < 32u)
+                if (ps2DiagLogBudget(std::cout,
+                                     "[DisableIntc]",
+                                     "PS2X_INTC_DISABLE_MAX_LOGS",
+                                     kMaxDisableLogs,
+                                     logIndex,
+                                     s_disableTruncated))
                 {
                     RUNTIME_LOG("[DisableIntc] cause=" << cause);
                 }
@@ -616,8 +793,16 @@ namespace ps2_syscalls
         {
             PS2_IF_AGRESSIVE_LOGS({
                 static std::atomic<uint32_t> s_addHandlerLogCount{0u};
+                static const uint32_t kMaxAddHandlerLogs =
+                    ps2DiagEnvLimit("PS2X_INTC_ADDHANDLER_MAX_LOGS", 32u);
+                static std::atomic<bool> s_addHandlerTruncated{false};
                 const uint32_t logIndex = s_addHandlerLogCount.fetch_add(1u, std::memory_order_relaxed);
-                if (logIndex < 32u)
+                if (ps2DiagLogBudget(std::cout,
+                                     "[AddIntcHandler]",
+                                     "PS2X_INTC_ADDHANDLER_MAX_LOGS",
+                                     kMaxAddHandlerLogs,
+                                     logIndex,
+                                     s_addHandlerTruncated))
                 {
                     auto flags = std::cout.flags();
                     std::cout << "[AddIntcHandler] cause=" << info.cause

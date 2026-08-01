@@ -73,7 +73,15 @@ namespace ps2_stubs
                     if (tryRead(candidate))
                     {
                         static uint32_t recoverLogCount = 0;
-                        if (recoverLogCount < 16)
+                        static const uint32_t kMaxRecoverLogs =
+                            ps2DiagEnvLimit("PS2X_CDREAD_RECOVER_MAX_LOGS", 16u);
+                        static std::atomic<bool> s_recoverTruncated{false};
+                        if (ps2DiagLogBudget(std::cerr,
+                                             "[sceCdRead:recovered]",
+                                             "PS2X_CDREAD_RECOVER_MAX_LOGS",
+                                             kMaxRecoverLogs,
+                                             recoverLogCount,
+                                             s_recoverTruncated))
                         {
                             RUNTIME_LOG("[sceCdRead] recovered with alternate args " << candidate.tag
                                                                                      << " (pc=0x" << std::hex << ctx->pc
@@ -100,7 +108,15 @@ namespace ps2_stubs
                 }
 
                 static uint32_t unresolvedLogCount = 0;
-                if (unresolvedLogCount < 32)
+                static const uint32_t kMaxUnresolvedLogs =
+                    ps2DiagEnvLimit("PS2X_CDREAD_UNRESOLVED_MAX_LOGS", 32u);
+                static std::atomic<bool> s_unresolvedTruncated{false};
+                if (ps2DiagLogBudget(std::cerr,
+                                     "[sceCdRead:unresolved]",
+                                     "PS2X_CDREAD_UNRESOLVED_MAX_LOGS",
+                                     kMaxUnresolvedLogs,
+                                     unresolvedLogCount,
+                                     s_unresolvedTruncated))
                 {
                     std::cerr << "[sceCdRead] unresolved request pc=0x" << std::hex << ctx->pc
                               << " ra=0x" << getRegU32(ctx, 31)

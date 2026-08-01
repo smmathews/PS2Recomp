@@ -2,10 +2,51 @@
 #define PS2_GS_GPU_H
 
 #include "ps2_gs_rasterizer.h"
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// GS packet-stream dump (PS2X_GS_DUMP): env-gated capture of raw GIF path
+// traffic in a PCSX2 GSdump-compatible on-disk format, so our own runtime's
+// GS stream can be replayed offline through the same tooling that already
+// parses PCSX2 oracle .gs captures (vertex/ADC census, GIFtag mode, batch
+// topology). OFF by default; enable with PS2X_GS_DUMP=<path to output file>.
+//
+// This is declaration only. Do NOT add logic here: the format and the
+// enable/flush/close policy live in ps2_gs_gpu.cpp. A previous instance of
+// diagnostic policy baked into an `inline` header function went stale inside
+// the rarely-rebuilt game corpus and silently capped a whole campaign's
+// diagnostics -- see project notes. All dump state is file-scope in the .cpp,
+// not a member of any struct with a corpus-visible layout (PS2Memory,
+// R5900Context, VU1State, VU1Interpreter, PS2Runtime are never touched).
+namespace GsDump
+{
+    // One-time env check + file open (writes the format header). Idempotent
+    // and safe to call from multiple sites; only the first call does work.
+    void init();
+
+    // Cheap enabled check for hot-path call sites: a single already-computed
+    // bool, no re-parsing of the environment.
+    bool isEnabled();
+
+    // Records one GIF path Transfer packet exactly as submitted to the GIF
+    // unit (raw GIFtag + payload bytes, untouched). dumpPathByte follows
+    // PCSX2's own on-disk GIF_PATH numbering (0=Path1, 1=Path2, 2=Path3,
+    // 3=Path1New) so byte-for-byte the same "path" bucket lines up with an
+    // oracle capture, where VU1 XGKICK traffic is path 3. No-op if the dump
+    // is not enabled. Never truncates, samples, or rate-limits: every call
+    // while enabled is written in full.
+    void writeTransfer(uint8_t dumpPathByte, const uint8_t *data, uint32_t sizeBytes);
+
+    // Flush + close. Safe to call multiple times and from an atexit handler;
+    // a run that is killed with a catchable signal (SIGINT/SIGTERM) still
+    // leaves a parseable prefix because every writeTransfer() call is one
+    // fully-buffered packet followed by an explicit flush.
+    void shutdown();
+}
 
 enum GSPrimType : uint8_t
 {
@@ -245,9 +286,26 @@ public:
     bool clearFramebufferContext(uint32_t contextIndex, uint32_t rgba);
     bool clearActiveFramebuffer(uint32_t rgba);
 
+    // Bounded RCA facility (env-gated, DQ8 black-field investigation):
+    // periodically dumps the raw contents of the candidate FIELD-mode
+    // framebuffers (fbp 0x0/0x70/0x150/0x1c0) as PPM + a non-black-pixel
+    // summary line. No-op unless DQ8_VRAM_DUMP names an output directory.
+    void debugDumpFieldFramebuffers();
+
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
     void refreshDisplaySnapshot();
+
+    // -----------------------------------------------------------------------
+    // Permanent low-noise draw statistics (read by the runtime's
+    // [gs-activity] summary line). Monotonic counters; lock-free reads.
+    //  - drawStatPrims():      primitives handed to the rasterizer
+    //  - drawStatImageBytes(): HWREG/IMAGE-mode bytes uploaded to local mem
+    //  - drawStatLastFbp():    FRAME.FBP (pages) of the most recent draw
+    // -----------------------------------------------------------------------
+    uint64_t drawStatPrims() const { return m_statPrims.load(std::memory_order_relaxed); }
+    uint64_t drawStatImageBytes() const { return m_statImageBytes.load(std::memory_order_relaxed); }
+    uint32_t drawStatLastFbp() const { return m_statLastDrawFbp.load(std::memory_order_relaxed); }
 
 private:
     void snapshotVRAM();
@@ -318,6 +376,11 @@ private:
     size_t m_localToHostReadPos = 0;
 
     GSRasterizer m_rasterizer;
+
+    // Draw statistics (see drawStat* accessors above).
+    std::atomic<uint64_t> m_statPrims{0};
+    std::atomic<uint64_t> m_statImageBytes{0};
+    std::atomic<uint32_t> m_statLastDrawFbp{0};
 };
 
 #endif

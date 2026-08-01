@@ -4,6 +4,7 @@ struct R5900Context;
 class  PS2Runtime;
 
 #include <cstdint>
+#include <vector>
 #include "ps2_call_list.h"
 #include "runtime/ps2_memory.h"
 #include "Stubs/Unimplemented.h"
@@ -41,4 +42,26 @@ namespace ps2_stubs
 
     void setMpegCompatLayout(const PS2MpegCompatLayout &layout);
     void clearMpegCompatLayout();
+
+    // Phase 3+4 FMV bring-up (recomp2-local; dq8/PS2_PROJECT_STATE §3.3x):
+    // synchronous host-side MPEG movie-decode session, implemented in
+    // Kernel/Stubs/MPEG.cpp. Declared here (rather than in MPEG.h) so
+    // callers outside the Kernel/Stubs tree -- e.g. dq8/runner/
+    // register_indirect.cpp's cmd-0xC mailbox feeder -- can reach it with
+    // just "ps2_stubs.h" (already included everywhere), matching the
+    // existing setMpegCompatLayout()/clearMpegCompatLayout() pattern above.
+    //
+    // startMpegMovieSession: begin decoding an already XOR-decrypted, whole
+    // .MVI file (MPEG-PS container bytes). Demuxes the video elementary
+    // stream internally. Returns false (and starts nothing) if the demux
+    // produces zero video ES bytes. Replaces/tears down any prior session.
+    bool startMpegMovieSession(std::vector<uint8_t> mviPlaintext);
+    // True while a movie-decode session is active and has not yet reached
+    // end-of-stream.
+    bool hasActiveMpegMovieSession();
+    // Configure the guest address sceMpegGetPicture writes 1 to when the
+    // active movie session's decoder drains (end-of-stream) -- the same
+    // "movie done" byte the M0-era insta-EOF hack used to set unconditionally
+    // (dq8/runner/register_indirect.cpp, [0x3d2a10]). 0 = disabled (no write).
+    void setMpegMovieDoneByteAddr(uint32_t addr);
 }

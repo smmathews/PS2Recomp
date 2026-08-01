@@ -13,6 +13,27 @@ project("PS2 Retro X")
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# ---- build-speed toolchain detection (recomp2 local patch; graceful degradation)
+if(NOT MSVC)
+    find_program(PS2X_MOLD_PROGRAM mold)
+    if(PS2X_MOLD_PROGRAM)
+        add_link_options(-fuse-ld=mold)
+        message(STATUS "PS2Recomp: linking with mold (${PS2X_MOLD_PROGRAM})")
+    endif()
+endif()
+# Debug-info level (recomp2 local patch): dev-loop default -g1; scripts/build.sh
+# maps BUILD_DEBUG=1 -> g (full), BUILD_DEBUG=0 -> g0. Changing forces a recompile.
+if(NOT MSVC)
+    set(PS2X_DEBUG_INFO "g1" CACHE STRING "Debug info flag suffix appended to all compiles: g0|g1|g")
+    add_compile_options("-${PS2X_DEBUG_INFO}")
+endif()
+find_program(PS2X_CCACHE_PROGRAM ccache)
+if(PS2X_CCACHE_PROGRAM AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${PS2X_CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER "${PS2X_CCACHE_PROGRAM}")
+    message(STATUS "PS2Recomp: using ccache (${PS2X_CCACHE_PROGRAM})")
+endif()
+
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
 option(PS2X_BUILD_RUNTIME "Build ps2xRuntime" ON)
 option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)

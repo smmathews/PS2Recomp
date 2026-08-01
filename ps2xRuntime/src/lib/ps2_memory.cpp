@@ -1,4 +1,5 @@
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_vif0.h"
 #include "ps2_log.h"
 #include <atomic>
 #include <iostream>
@@ -505,7 +506,13 @@ void PS2Memory::write8(uint32_t address, uint8_t value)
     }
     else if (physAddr >= PS2_IO_BASE && physAddr < PS2_IO_BASE + PS2_IO_SIZE)
     {
-        // IO registers - handle byte writes by modifying the appropriate byte in the word
+        // IO registers - handle byte writes by modifying the appropriate byte in the word.
+        // This also covers real-hardware DMA kicks that write only the STR
+        // byte (CHCR+1, e.g. a single `sb 1, CHCR+1`): regAddr masks down to
+        // the channel's CHCR word (offset 0), the merge ORs the STR bit into
+        // bit 8 of the previously-stored CHCR value, and writeIORegister()
+        // below runs through the exact same DMA-start gate a 32-bit CHCR
+        // write would. No separate byte-write path is needed.
         uint32_t regAddr = physAddr & ~0x3;
         uint32_t shift = (physAddr & 3) * 8;
         uint32_t mask = ~(0xFF << shift);
@@ -702,6 +709,53 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 *reg = (*reg & ~mask) | (static_cast<uint64_t>(value) << (off * 8u));
             }
         }
+        // FMV-visibility RCA (2026-07-25). sceGsPutDispEnv is NOT the only way
+        // the display can be moved: presentation registers are also writable
+        // straight through GS privileged MMIO, bypassing libgraph entirely
+        // (DC2 learnings spec 08 sec 3 flags exactly this "the obvious path is
+        // not the only path" class). If a movie player repointed DISPFB at its
+        // own decoded VRAM surface, this is the only place it would show up.
+        // Logs PMODE/SMODE2/DISPFB1/DISPLAY1/DISPFB2/DISPLAY2 on change only
+        // (they are rare); env-gated so normal boots are byte-identical.
+        {
+            static const bool s_on = []() {
+                const char *e = std::getenv("DQ8_DISPREG_TRACE");
+                return e && *e && *e != '0';
+            }();
+            if (s_on)
+            {
+                const uint32_t regBase = (address - PS2_GS_PRIV_REG_BASE) & ~0xFu;
+                const char *name = nullptr;
+                size_t slot = 0u;
+                switch (regBase)
+                {
+                case 0x00u: name = "PMODE";    slot = 0u; break;
+                case 0x20u: name = "SMODE2";   slot = 1u; break;
+                case 0x70u: name = "DISPFB1";  slot = 2u; break;
+                case 0x80u: name = "DISPLAY1"; slot = 3u; break;
+                case 0x90u: name = "DISPFB2";  slot = 4u; break;
+                case 0xA0u: name = "DISPLAY2"; slot = 5u; break;
+                default: break;
+                }
+                if (name)
+                {
+                    static std::atomic<uint64_t> s_last[6]{};
+                    const uint64_t now = *gsRegPtr(gs_regs, address);
+                    if (s_last[slot].exchange(now, std::memory_order_relaxed) != now)
+                    {
+                        std::cout << "[gs:dispreg] " << name
+                                  << std::hex << " val=0x" << now
+                                  << "  pmode=0x" << gs_regs.pmode
+                                  << " dispfb1=0x" << gs_regs.dispfb1
+                                  << " display1=0x" << gs_regs.display1
+                                  << " dispfb2=0x" << gs_regs.dispfb2
+                                  << " display2=0x" << gs_regs.display2
+                                  << std::dec << std::endl;
+                    }
+                }
+            }
+        }
+
         m_gsWriteCount.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -829,13 +883,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
-            if ((channelBase == 0x1000A000 || channelBase == 0x10009000) && m_gsVRAM)
+            // Channel 0 (VIF0, 0x10008000) used to fall through this whole
+            // block unhandled, so DQ8's VU0 microprogram upload (uploader
+            // sub_0013CD10, packet at guest 0x390740) was silently discarded
+            // and VU0 micro memory stayed all zeroes. It is admitted here
+            // without requiring m_gsVRAM: VIF0 feeds VU0, which never touches
+            // the framebuffer, so gating it on GS VRAM would be wrong.
+            if ((channelBase == 0x1000A000 || channelBase == 0x10009000 || channelBase == 0x10008000) &&
+                (m_gsVRAM || channelBase == 0x10008000))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
                         return;
                     const bool scratch = isScratchpad(srcAddr);
+                    if (channelBase == 0x10008000)
+                    {
+                        ps2xEnqueueVif0Transfer(scratch, srcAddr, qwCount);
+                        return;
+                    }
                     PendingTransfer pt;
                     pt.fromScratchpad = scratch;
                     pt.srcAddr = srcAddr;
@@ -860,8 +926,18 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // A DQ8 field/cutscene geometry list is ~4.6k tags (measured
+                    // on the oracle savestate's own chain at 0x004D0800), so the
+                    // old 4096 cap silently truncated the tail of every frame's
+                    // display list. The cap exists only to bound a corrupt
+                    // (self-referential) chain, so it can be far larger.
+                    const int kMaxChainTags = 65536;
                     std::vector<uint8_t> chainBuf;
+                    // (chainBuf offset -> guest physical address) for each
+                    // coalesced segment, so a later parse offset can be mapped
+                    // back to the EE address the bytes came from. Diagnostics
+                    // only; see PendingTransfer::chainSegMap.
+                    std::vector<std::pair<uint32_t, uint32_t>> chainSegMap;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -891,26 +967,37 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
+                            chainSegMap.emplace_back(static_cast<uint32_t>(chainBuf.size()),
+                                                     scratch ? 0xFFFFFFFFu : src);
                             chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
                         }
                     };
 
-                    auto appendCompactVif1TagData = [&](uint32_t localTagAddr, uint32_t qwCount)
+                    // CHCR.TTE: append the DMAtag's upper quadword half (2 VIF
+                    // codes) to the stream. Independent of the tag's payload --
+                    // it must happen for qwc==0 tags and for REF/REFS tags whose
+                    // payload lives at a different address.
+                    auto appendTagQword = [&](uint32_t localTagAddr)
                     {
+                        const bool tagScratch = isScratchpad(localTagAddr);
                         uint32_t tagPhys = 0u;
-                        const bool tagScratch = isScratchpad(localTagAddr); 
-                        tagPhys = translateAddress(localTagAddr);
-                        
+                        try
+                        {
+                            tagPhys = translateAddress(localTagAddr);
+                        }
+                        catch (...)
+                        {
+                            return;
+                        }
                         const uint8_t *localBase = tagScratch ? m_scratchpad : m_rdram;
                         const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
                         if (tagPhys + 16u > localMax)
                             return;
-
-                        // VIF1 packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
+                        chainSegMap.emplace_back(static_cast<uint32_t>(chainBuf.size()),
+                                                 tagScratch ? 0xFFFFFFFFu : (tagPhys + 8u));
                         chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
-                        appendData(localTagAddr + 16u, qwCount);
                     };
 
                     int tagsProcessed = 0;
@@ -945,6 +1032,390 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                         const uint8_t *tp = tagBase + physTag;
                         uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "dma chain tag", tagAddr);
+                        uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
+                        uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
+                        const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
+                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        ++tagsProcessed;
+
+                        // Bounded permanent dump of source-chain tags: diagnoses
+                        // flattened-stream misalignment (wrong qwc/addr/tag-id
+                        // handling) that is invisible downstream once the chain
+                        // has been glued into one buffer.
+                        {
+                            static std::atomic<uint64_t> s_chainTagCount{0};
+                            const uint64_t n = s_chainTagCount.fetch_add(1, std::memory_order_relaxed);
+                            if (n < 96u)
+                            {
+                                uint64_t tagHi = 0u;
+                                std::memcpy(&tagHi, tp + 8, sizeof(tagHi));
+                                std::cout << "[dma:chain] #" << n
+                                          << " ch=0x" << std::hex << channelBase
+                                          << " chcr=0x" << chcr
+                                          << " tagAddr=0x" << currentTagAddr
+                                          << " tag=0x" << tag
+                                          << " tagHi=0x" << tagHi
+                                          << " id=" << std::dec << id
+                                          << " qwc=" << tagQwc
+                                          << std::hex
+                                          << " addr=0x" << addr
+                                          << std::dec
+                                          << " chainOff=" << chainBuf.size()
+                                          << std::endl;
+
+                                // Payload preview: first 4 qwords (and for
+                                // long payloads also the last 2), resolved
+                                // through the same address translation the
+                                // append uses. Shows exactly which qwords the
+                                // flattened GIF stream will contain.
+                                uint32_t payloadAddr = 0u;
+                                switch (id)
+                                {
+                                case 0:
+                                case 3:
+                                case 4:
+                                    payloadAddr = addr;
+                                    break;
+                                default:
+                                    payloadAddr = currentTagAddr + 16u;
+                                    break;
+                                }
+                                if (tagQwc > 0u)
+                                {
+                                    const bool pScratch = isScratchpad(payloadAddr);
+                                    uint32_t pPhys = 0u;
+                                    bool ok = true;
+                                    try
+                                    {
+                                        pPhys = translateAddress(payloadAddr);
+                                    }
+                                    catch (...)
+                                    {
+                                        ok = false;
+                                    }
+                                    const uint8_t *pBase = pScratch ? m_scratchpad : m_rdram;
+                                    const uint32_t pMax = pScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                                    if (ok)
+                                    {
+                                        auto dumpQw = [&](uint32_t qwIdx)
+                                        {
+                                            const uint32_t off = pPhys + qwIdx * 16u;
+                                            if (off + 16u > pMax)
+                                                return;
+                                            uint64_t lo = 0u, hi = 0u;
+                                            std::memcpy(&lo, pBase + off, 8);
+                                            std::memcpy(&hi, pBase + off + 8, 8);
+                                            std::cout << "[dma:chain]   qw[" << qwIdx << "]"
+                                                      << std::hex
+                                                      << " lo=0x" << lo
+                                                      << " hi=0x" << hi
+                                                      << std::dec << std::endl;
+                                        };
+                                        const uint32_t headQw = std::min<uint32_t>(tagQwc, 4u);
+                                        for (uint32_t q = 0; q < headQw; ++q)
+                                            dumpQw(q);
+                                        if (tagQwc > 6u)
+                                        {
+                                            dumpQw(tagQwc - 2u);
+                                            dumpQw(tagQwc - 1u);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        uint32_t dataAddr = 0;
+                        bool hasPayload = (tagQwc > 0);
+                        bool endChain = false;
+
+                        switch (id)
+                        {
+                        case 0:
+                            dataAddr = addr;
+                            tagAddr = tagAddr + 16;
+                            endChain = true;
+                            break;
+                        case 1:
+                            dataAddr = tagAddr + 16;
+                            tagAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
+                            break;
+                        case 2:
+                            dataAddr = tagAddr + 16;
+                            tagAddr = addr;
+                            break;
+                        case 3:
+                        case 4:
+                            dataAddr = addr;
+                            tagAddr = tagAddr + 16;
+                            break;
+                        case 5:
+                            dataAddr = tagAddr + 16;
+                            {
+                                const uint32_t retAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
+                                if (asp == 0u)
+                                {
+                                    asr0 = retAddr;
+                                    asp = 1u;
+                                }
+                                else if (asp == 1u)
+                                {
+                                    asr1 = retAddr;
+                                    asp = 2u;
+                                }
+                            }
+                            tagAddr = addr;
+                            break;
+                        case 6:
+                            dataAddr = tagAddr + 16;
+                            if (asp == 2u)
+                            {
+                                tagAddr = asr1;
+                                asp = 1u;
+                            }
+                            else if (asp == 1u)
+                            {
+                                tagAddr = asr0;
+                                asp = 0u;
+                            }
+                            else
+                            {
+                                endChain = true;
+                            }
+                            break;
+                        case 7:
+                            dataAddr = tagAddr + 16;
+                            endChain = true;
+                            break;
+                        default:
+                            hasPayload = false;
+                            endChain = true;
+                            break;
+                        }
+
+                        // DMAtag "tag transfer": on a VIF1 source chain the tag's
+                        // UPPER quadword half is two VIF codes and is part of the
+                        // VIF stream, transferred BEFORE that tag's payload -- for
+                        // EVERY tag, whatever its id, and whether or not it carries
+                        // a payload.
+                        //
+                        // The previous rule ("id in {1,2,5,6,7} AND qwc>0") dropped
+                        // those 8 bytes in exactly the two shapes DQ8's geometry
+                        // display list is built from:
+                        //   * `MSCAL 100` -- the VU1 T&L kernel entry -- rides in
+                        //     the upper half of qwc==0 CNT tags. Dropping it meant
+                        //     VU1 was never handed a geometry batch at all: every
+                        //     MSCAL the runtime ever saw was imm=0 (the light/
+                        //     matrix setup program), which ends on its E-bit and
+                        //     parks in its 84<->86 idle loop, so every XGKICK was
+                        //     the setup program's bare nloop=0 tag at VU qw19.
+                        //   * every REF tag's `STCYCL`+`UNPACK` (or `DIRECT`) pair
+                        //     rides in the upper half ahead of the ref'd payload.
+                        //     Dropping it fed that payload to the VIF parser as if
+                        //     it were vifcodes.
+                        //
+                        // Measured on the PCSX2 oracle savestate's own display list
+                        // (dq8/oracle-frames/savestates/newgame-opening-cutscene-
+                        // e01.p2s, chain at 0x004D0800): the old walk yields
+                        // MSCAL{0:16, 300:9} and 167 KB of UNPACK payload; the
+                        // correct walk yields MSCAL{0:134, 100:171, 300:42} and
+                        // 621 KB.
+                        //
+                        // Not gated on CHCR.TTE: DQ8 pokes VIF1's CHCR twice per
+                        // list (0xC5 with TTE set, then 0x185 to start), so the
+                        // value latched at STR time reports TTE=0 even though every
+                        // observed VIF1 chain -- title, menu and geometry alike --
+                        // carries live vifcodes in its tag halves. The oracle's own
+                        // D1_CHCR reads 0x70000045 (TTE=1). Gating on the bit as
+                        // latched here breaks the title/menu lists.
+                        // VIF0 gets the same treatment as VIF1: DQ8's VU0
+                        // upload rides in the tag half (DMAtag 0x10000043 at
+                        // guest 0x390740, VIFcode 0x4A700000 = MPG NUM=0x70 to
+                        // micro address 0) with the 112-instruction body as the
+                        // tag's payload at 0x390750. Skipping the tag half here
+                        // would drop the MPG vifcode and feed the microprogram
+                        // body to the parser as if it were vifcodes.
+                        if (channelBase == 0x10009000u || channelBase == 0x10008000u)
+                            appendTagQword(currentTagAddr);
+                        if (hasPayload)
+                            appendData(dataAddr, tagQwc);
+                        if (irq && tieEnabled)
+                            endChain = true;
+                        if (endChain)
+                            break;
+                    }
+
+                    if (channelBase == 0x10009000u && !chainBuf.empty())
+                    {
+                        static const char *dumpPrefix = std::getenv("PS2X_VIFDUMP");
+                        if (dumpPrefix && dumpPrefix[0])
+                        {
+                            static std::atomic<uint64_t> s_dumped{0};
+                            const uint64_t dn = s_dumped.fetch_add(1, std::memory_order_relaxed);
+                            if (dn < 3u)
+                            {
+                                char path[512];
+                                std::snprintf(path, sizeof(path), "%s.%llu.bin", dumpPrefix,
+                                              static_cast<unsigned long long>(dn));
+                                if (FILE *f = std::fopen(path, "wb"))
+                                {
+                                    std::fwrite(chainBuf.data(), 1, chainBuf.size(), f);
+                                    std::fclose(f);
+                                }
+                            }
+                        }
+                    }
+
+                    m_ioRegisters[channelBase + 0x30] = tagAddr;
+                    m_ioRegisters[channelBase + 0x40] = asr0;
+                    m_ioRegisters[channelBase + 0x50] = asr1;
+                    chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
+                    m_ioRegisters[channelBase + 0x00] = chcr;
+
+                    if (!chainBuf.empty())
+                    {
+                        if (channelBase == 0x10008000)
+                        {
+                            ps2xEnqueueVif0Chain(std::move(chainBuf), std::move(chainSegMap));
+                        }
+                        else
+                        {
+                            PendingTransfer pt;
+                            pt.fromScratchpad = false;
+                            pt.srcAddr = 0;
+                            pt.qwc = 0;
+                            pt.chainData = std::move(chainBuf);
+                            pt.chainSegMap = std::move(chainSegMap);
+                            if (channelBase == 0x1000A000)
+                            {
+                                m_pendingGifTransfers.push_back(std::move(pt));
+                            }
+                            else if (channelBase == 0x10009000)
+                            {
+                                m_pendingVif1Transfers.push_back(std::move(pt));
+                            }
+                        }
+                    }
+                }
+                else if (qwc > 0)
+                {
+                    enqueueTransfer(madr, qwc);
+                }
+
+                const bool autoProcessTransfers =
+                    (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
+                if (autoProcessTransfers)
+                {
+                    processPendingTransfers();
+                }
+            }
+            else if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                // D8 (toSPR, 0x1000D000u): main RAM (MADR) -> scratchpad (SADR)
+                // D9 (fromSPR, 0x1000D400u): scratchpad (SADR) -> main RAM (MADR)
+                //
+                // Level-5's "mg" library (DQ8) stages every VU1 geometry packet
+                // in scratchpad and moves it with this ping-pong (see
+                // sub_00111A28: D9_SADR=0, D9_MADR=$s2, D9_QWC=$s4,
+                // D9_CHCR=STR|DIR=0x101; D8_SADR=0, D8_MADR=$s1). These two
+                // channels used to be silently unimplemented: the CHCR write
+                // fell through to no-op here, and the STR force-clear on
+                // read (below, shared by the whole 0x10008000-0x1000EFFF
+                // range) let the guest's completion poll succeed immediately
+                // even though nothing was copied.
+                const bool fromSpr = (channelBase == 0x1000D400u);
+                uint32_t chcr = value;
+                uint32_t mode = (chcr >> 2) & 0x3u;
+                uint32_t sadr = m_ioRegisters[channelBase + 0x80] & (PS2_SCRATCHPAD_SIZE - 1u);
+
+                // Bring-up probe (PS2X_SPR_TRACE): confirms this branch is
+                // reached at all and shows the parameters the guest programmed.
+                // Zero cost when unset; first 40 events only.
+                {
+                    static const bool s_sprTrace = []() {
+                        const char *e = std::getenv("PS2X_SPR_TRACE");
+                        return e && e[0] == '1' && e[1] == '\0';
+                    }();
+                    static std::atomic<uint32_t> s_sprN{0};
+                    if (s_sprTrace)
+                    {
+                        const uint32_t n = s_sprN.fetch_add(1, std::memory_order_relaxed);
+                        if (n < 40u)
+                        {
+                            std::cerr << "[dma:spr] #" << std::dec << n
+                                      << (fromSpr ? " fromSPR(ch9)" : " toSPR(ch8)")
+                                      << " chcr=0x" << std::hex << chcr
+                                      << " mode=" << std::dec << mode
+                                      << " madr=0x" << std::hex << m_ioRegisters[channelBase + 0x10]
+                                      << " qwc=" << std::dec << m_ioRegisters[channelBase + 0x20]
+                                      << " sadr=0x" << std::hex << sadr
+                                      << " tadr=0x" << m_ioRegisters[channelBase + 0x30]
+                                      << std::dec << std::endl;
+                        }
+                    }
+                }
+
+                // Copies one quadword between scratchpad[sadr] and RAM[ramAddr]
+                // (direction fixed by the channel), then advances/wraps SADR
+                // within the 16KB scratchpad.
+                auto copyQuadword = [&](uint32_t ramAddr)
+                {
+                    uint32_t ramPhys = 0u;
+                    try
+                    {
+                        ramPhys = translateAddress(ramAddr);
+                    }
+                    catch (...)
+                    {
+                        return;
+                    }
+                    if (ramPhys + 16u > PS2_RAM_SIZE)
+                        return;
+                    if (fromSpr)
+                        std::memcpy(m_rdram + ramPhys, m_scratchpad + sadr, 16);
+                    else
+                        std::memcpy(m_scratchpad + sadr, m_rdram + ramPhys, 16);
+                    sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+                };
+
+                auto copyRun = [&](uint32_t ramAddr, uint32_t qwCount)
+                {
+                    for (uint32_t i = 0; i < qwCount; ++i)
+                    {
+                        copyQuadword(ramAddr);
+                        ramAddr += 16u;
+                    }
+                };
+
+                if (mode == 1)
+                {
+                    // Chain mode: identical DMAtag walk/ID semantics to the
+                    // VIF1/GIF chain handling above (TADR is the tag-chain
+                    // pointer, same tag-id switch), except the payload is
+                    // copied directly to/from the scratchpad instead of being
+                    // queued for a VIF/GIF consumer.
+                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
+                    uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                    uint32_t asp = (chcr >> 4) & 0x3u;
+                    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                    const int kMaxChainTags = 4096;
+                    int tagsProcessed = 0;
+
+                    while (tagsProcessed < kMaxChainTags)
+                    {
+                        uint32_t physTag = 0;
+                        try
+                        {
+                            physTag = translateAddress(tagAddr);
+                        }
+                        catch (...)
+                        {
+                            break;
+                        }
+                        if (physTag + 16u > PS2_RAM_SIZE)
+                            break;
+
+                        uint64_t tag = loadScalar<uint64_t>(m_rdram, physTag, PS2_RAM_SIZE, "spr dma chain tag", tagAddr);
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
@@ -1020,15 +1491,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         }
 
                         if (hasPayload)
-                        {
-                            const bool compactVif1LocalPayload =
-                                (channelBase == 0x10009000u) &&
-                                (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
-                            if (compactVif1LocalPayload)
-                                appendCompactVif1TagData(currentTagAddr, tagQwc);
-                            else
-                                appendData(dataAddr, tagQwc);
-                        }
+                            copyRun(dataAddr, tagQwc);
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -1040,39 +1503,15 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_ioRegisters[channelBase + 0x50] = asr1;
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
                     m_ioRegisters[channelBase + 0x00] = chcr;
-
-                    if (!chainBuf.empty())
-                    {
-                        PendingTransfer pt;
-                        pt.fromScratchpad = false;
-                        pt.srcAddr = 0;
-                        pt.qwc = 0;
-                        pt.chainData = std::move(chainBuf);
-                        if (channelBase == 0x1000A000)
-                        {
-                            m_pendingGifTransfers.push_back(std::move(pt));
-                        }
-                        else if (channelBase == 0x10009000)
-                        {
-                            m_pendingVif1Transfers.push_back(std::move(pt));
-                        }
-                    }
-                    // else if (channelBase == 0x10009000u)
-                    // {
-
-                    // }
                 }
                 else if (qwc > 0)
                 {
-                    enqueueTransfer(madr, qwc);
+                    // Normal mode: a straight run of QWC quadwords starting at
+                    // MADR -- the DQ8 fromSPR/toSPR ping-pong path.
+                    copyRun(madr, qwc);
                 }
 
-                const bool autoProcessTransfers =
-                    (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
-                if (autoProcessTransfers)
-                {
-                    processPendingTransfers();
-                }
+                m_ioRegisters[channelBase + 0x80] = sadr;
             }
         }
         return true;
@@ -1160,12 +1599,21 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingGifTransfers.clear();
 
+    // VIF0 is drained before VIF1 so that a VU0 microprogram uploaded in the
+    // same batch is resident before any EE code that VCALLMSs into it runs.
+    const bool hadVif0 = ps2xHasPendingVif0();
+    if (hadVif0)
+        ps2xDrainVif0Transfers(*this);
+
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
     {
         if (!p.chainData.empty())
         {
+            extern std::vector<std::pair<uint32_t, uint32_t>> g_vif1ChainSegMap;
+            g_vif1ChainSegMap = p.chainSegMap;
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            g_vif1ChainSegMap.clear();
         }
         else if (p.qwc > 0)
         {
@@ -1223,6 +1671,7 @@ void PS2Memory::processPendingTransfers()
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF1_CHANNEL = 0x10009000;
+    static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
     static constexpr uint32_t D_STAT = 0x1000E010u;
 
     auto raiseDStatChannel = [&](uint32_t channelBit)
@@ -1251,6 +1700,12 @@ void PS2Memory::processPendingTransfers()
         raiseDStatChannel(1u); // VIF1 channel
         m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
         m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+    }
+    if (hadVif0)
+    {
+        raiseDStatChannel(0u); // VIF0 channel
+        m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
+        m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
     }
 }
 

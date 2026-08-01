@@ -64,9 +64,17 @@ namespace
 
     static void logDeci2Text(const char *prefix, const std::string &text)
     {
-        constexpr uint32_t kMaxDeci2TextLogs = 256u;
+        constexpr uint32_t kMaxDeci2TextLogsDefault = 256u;
+        static const uint32_t kMaxDeci2TextLogs =
+            ps2DiagEnvLimit("PS2X_DECI2_TEXT_MAX_LOGS", kMaxDeci2TextLogsDefault);
+        static std::atomic<bool> s_deci2TextTruncated{false};
         const uint32_t logIndex = g_deci2LogCount.fetch_add(1u, std::memory_order_relaxed);
-        if (logIndex >= kMaxDeci2TextLogs)
+        if (!ps2DiagLogBudget(std::cerr,
+                              "[Deci2Call:text]",
+                              "PS2X_DECI2_TEXT_MAX_LOGS",
+                              kMaxDeci2TextLogs,
+                              logIndex,
+                              s_deci2TextTruncated))
         {
             return;
         }
@@ -211,9 +219,17 @@ namespace ps2_syscalls
         default:
         {
             static std::atomic<uint32_t> s_unknownDeci2Logs{0u};
-            constexpr uint32_t kMaxUnknownDeci2Logs = 64u;
+            constexpr uint32_t kMaxUnknownDeci2LogsDefault = 64u;
+            static const uint32_t kMaxUnknownDeci2Logs =
+                ps2DiagEnvLimit("PS2X_DECI2_UNKNOWN_MAX_LOGS", kMaxUnknownDeci2LogsDefault);
+            static std::atomic<bool> s_unknownDeci2Truncated{false};
             const uint32_t logIndex = s_unknownDeci2Logs.fetch_add(1u, std::memory_order_relaxed);
-            if (logIndex < kMaxUnknownDeci2Logs)
+            if (ps2DiagLogBudget(std::cerr,
+                                 "[Deci2Call:unknown]",
+                                 "PS2X_DECI2_UNKNOWN_MAX_LOGS",
+                                 kMaxUnknownDeci2Logs,
+                                 logIndex,
+                                 s_unknownDeci2Truncated))
             {
                 std::cerr << "[Deci2Call:unknown]"
                           << " code=" << code

@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
+#include "../Syscalls/Thread.h"
 
 #include <map>
 
@@ -582,6 +583,17 @@ namespace ps2_stubs
 
     void sceSifRpcLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // Real sceSifRpcLoop is `while (1) { SleepThread(); serve request; }` —
+        // the RPC server thread spends its life parked in SleepThread and is
+        // only woken by SIF RPC deliveries. All SIF RPC traffic here is HLE'd
+        // host-side, so no WakeupThread ever targets this thread: park it via
+        // the real SleepThread syscall. Returning without blocking instead
+        // (the old behaviour) left ctx->pc at the loop entry, so the dispatch
+        // loop re-entered this stub forever and the server fiber monopolized
+        // the N=1 guest executor, starving every other guest thread.
+        // ctx->pc is intentionally left at the loop entry: a stray wakeup
+        // simply re-enters and sleeps again, exactly like the real loop.
+        ps2_syscalls::SleepThread(rdram, ctx, runtime);
         setReturnS32(ctx, 0);
     }
 

@@ -390,9 +390,23 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        // Diagnostics only (PS2X_VU1WATCH): the DMA chain walker coalesces many
+        // separate guest segments into one flat chainData buffer, which throws
+        // away the guest address every byte came from. That is why the VU1
+        // data-memory watch can report "this transform block is wrong" but not
+        // "this EE address wrote it". Each entry is (offset into chainData,
+        // guest physical address of that segment's first byte) in increasing
+        // offset order, so a parse offset maps back to guest memory.
+        std::vector<std::pair<uint32_t, uint32_t>> chainSegMap;
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    // NOTE: the segment map of the chain *currently being interpreted* is
+    // deliberately NOT a member here. Adding a data member to PS2Memory changes
+    // its layout, which breaks ABI against an already-compiled recompiled
+    // corpus and segfaults on load. It lives as a translation-unit global in
+    // ps2_vif1_interpreter.cpp instead. Growing PendingTransfer is safe because
+    // sizeof(std::vector<T>) does not depend on T.
 
     struct CodeRegion
     {

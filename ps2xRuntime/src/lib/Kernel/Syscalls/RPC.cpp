@@ -502,6 +502,153 @@ namespace ps2_syscalls
             }
         }
 
+        // One line per (fno, first-16-occurrences) for the game-parameterized
+        // SoundDriver service: low-noise permanent visibility into the RPC
+        // protocol the guest actually speaks (needed to LEARN subcommand
+        // numbers before implementing their semantics). Caller holds no lock;
+        // this takes g_rpc_mutex only for the counter map.
+        void logSoundDriverGameRpc(uint32_t sid, uint32_t rpcNum, uint32_t sendSize,
+                                   uint32_t recvSize, const char *disposition)
+        {
+            static std::unordered_map<uint32_t, uint32_t> countsByFno;
+            uint32_t n = 0u;
+            {
+                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                n = ++countsByFno[rpcNum];
+            }
+            if (n <= 16u || (n & 0xFFu) == 0u)
+            {
+                std::cout << "[sdrdrv-hle] sid=0x" << std::hex << sid
+                          << " fno=0x" << rpcNum << std::dec
+                          << " send=" << sendSize
+                          << " recv=" << recvSize
+                          << " n=" << n
+                          << " -> " << disposition << std::endl;
+            }
+        }
+
+        // Game-parameterized SoundDriver HLE (see runtime/ps2_sounddriver.h).
+        // Answers the game's SDRDRV-family SIF-RPC service at the SIF
+        // boundary: writes the few IOP-produced VALUES the EE driver reads
+        // back (stream-ready state, SPU2 handles, completion flags) and
+        // completes everything else benignly. The guest driver walks its own
+        // state machines off these values — no direct FSM seeding.
+        bool handleSoundDriverGameLayoutRpc(uint8_t *rdram, PS2Runtime *runtime,
+                                            uint32_t sid, uint32_t rpcNum,
+                                            uint32_t sendBuf, uint32_t sendSize,
+                                            uint32_t recvBuf, uint32_t recvSize,
+                                            uint32_t &resultPtr,
+                                            bool &signalNowaitCompletion)
+        {
+            PS2SoundDriverGameLayout gl{};
+            {
+                std::lock_guard<std::mutex> lock(g_rpc_mutex);
+                gl = g_soundDriverGameLayout;
+            }
+            if (!gl.enabled() || sid != gl.serviceSid)
+            {
+                return false;
+            }
+
+            // First contact: publish the SPU2 transfer-channel handles the EE
+            // driver reads back. Idempotent writes; cheap enough to do on
+            // every call.
+            for (int i = 0; i < 2; ++i)
+            {
+                if (gl.spu2HandleAddr[i] != 0u)
+                {
+                    (void)writeGuestU32(rdram, gl.spu2HandleAddr[i], gl.spu2HandleValue[i]);
+                }
+            }
+
+            if (gl.streamOpenFno != 0u && rpcNum == gl.streamOpenFno)
+            {
+                if (gl.streamStateAddr != 0u)
+                {
+                    (void)writeGuestU32(rdram, gl.streamStateAddr, gl.streamStateReadyValue);
+                    std::cout << "[sdrdrv-hle] stream-open: [0x" << std::hex
+                              << gl.streamStateAddr << "] = 0x"
+                              << gl.streamStateReadyValue << std::dec << std::endl;
+                }
+                if (recvBuf && recvSize >= sizeof(uint32_t))
+                {
+                    (void)writeGuestU32(rdram, recvBuf, 0u);
+                    resultPtr = recvBuf;
+                }
+                signalNowaitCompletion = true;
+                logSoundDriverGameRpc(sid, rpcNum, sendSize, recvSize, "stream-open");
+                return true;
+            }
+
+            if (gl.channelConfigFno != 0u && rpcNum == gl.channelConfigFno)
+            {
+                // Arm the channel: set the alloc flag so the EE-side per-tick
+                // channel driver picks the channel object up and advances it
+                // naturally. Channel index from the first send word when
+                // available, else 0.
+                uint32_t channel = 0u;
+                if (sendBuf && sendSize >= sizeof(uint32_t))
+                {
+                    uint32_t w0 = 0u;
+                    (void)readGuestU32(rdram, sendBuf, w0);
+                    if (w0 < 16u)
+                    {
+                        channel = w0;
+                    }
+                }
+                if (gl.channelAllocFlagTableAddr != 0u)
+                {
+                    uint8_t *flag = getMemPtr(rdram, gl.channelAllocFlagTableAddr + channel);
+                    if (flag)
+                    {
+                        *flag = 1u;
+                    }
+                    std::cout << "[sdrdrv-hle] channel-config: alloc[0x" << std::hex
+                              << gl.channelAllocFlagTableAddr << std::dec
+                              << "+" << channel << "] = 1" << std::endl;
+                }
+                if (recvBuf && recvSize >= sizeof(uint32_t))
+                {
+                    (void)writeGuestU32(rdram, recvBuf, 0u);
+                    resultPtr = recvBuf;
+                }
+                signalNowaitCompletion = true;
+                logSoundDriverGameRpc(sid, rpcNum, sendSize, recvSize, "channel-config");
+                return true;
+            }
+
+            if (gl.stopFno != 0u && rpcNum == gl.stopFno)
+            {
+                if (gl.stopCompletionFlagAddr != 0u)
+                {
+                    (void)writeGuestU32(rdram, gl.stopCompletionFlagAddr, 1u);
+                    std::cout << "[sdrdrv-hle] stop: [0x" << std::hex
+                              << gl.stopCompletionFlagAddr << "] = 1" << std::dec << std::endl;
+                }
+                if (recvBuf && recvSize >= sizeof(uint32_t))
+                {
+                    (void)writeGuestU32(rdram, recvBuf, 0u);
+                    resultPtr = recvBuf;
+                }
+                signalNowaitCompletion = true;
+                logSoundDriverGameRpc(sid, rpcNum, sendSize, recvSize, "stop");
+                return true;
+            }
+
+            // Default: benign completion. recv[0] = benignStatusValue (matches
+            // a real driver's "no audio work required" status; known-benign
+            // callers discard it). Return FALSE so lower layers (e.g. the
+            // LIBSD audio backend hook, game-registered handlers) still see
+            // the call and can add fidelity (SE sample playback); they do not
+            // overwrite recv[0].
+            if (recvBuf && recvSize >= sizeof(uint32_t))
+            {
+                (void)writeGuestU32(rdram, recvBuf, gl.benignStatusValue);
+            }
+            logSoundDriverGameRpc(sid, rpcNum, sendSize, recvSize, "benign (fall-through)");
+            return false;
+        }
+
         bool handleSoundDriverRpcServiceImpl(uint8_t *rdram, PS2Runtime *runtime,
                                              uint32_t sid, uint32_t rpcNum,
                                              uint32_t sendBuf, uint32_t sendSize,
@@ -515,6 +662,16 @@ namespace ps2_syscalls
             if (!runtime || !rdram)
             {
                 return false;
+            }
+
+            if (handleSoundDriverGameLayoutRpc(rdram, runtime,
+                                               sid, rpcNum,
+                                               sendBuf, sendSize,
+                                               recvBuf, recvSize,
+                                               resultPtr,
+                                               signalNowaitCompletion))
+            {
+                return true;
             }
 
             if (sid == IOP_SID_SNDDRV_COMMAND && rpcNum == IOP_RPC_SNDDRV_SUBMIT)
@@ -590,6 +747,7 @@ namespace ps2_syscalls
 
             bool signaled = false;
             int wokenTid = 0;
+            uint64_t wokenToken = 0u;
             {
                 std::lock_guard<std::mutex> lock(sema->m);
                 if (!sema->deleted && sema->count < sema->maxCount)
@@ -598,7 +756,8 @@ namespace ps2_syscalls
                     signaled = true;
                     if (!sema->waitList.empty())
                     {
-                        wokenTid = sema->waitList.front();
+                        wokenTid   = sema->waitList.front().first;
+                        wokenToken = sema->waitList.front().second;
                         sema->waitList.erase(sema->waitList.begin());
                     }
                 }
@@ -607,7 +766,7 @@ namespace ps2_syscalls
             if (wokenTid != 0)
             {
                 // Called from the RPC worker (non-guest host thread).
-                ps2sched::enqueue_external_wakeup(wokenTid);
+                ps2sched::enqueue_external_wakeup_validated(wokenTid, wokenToken);
             }
             return signaled;
         }
@@ -969,7 +1128,15 @@ namespace ps2_syscalls
         if (!found)
         {
             static uint32_t dtxMissLogCount = 0u;
-            if (dtxMissLogCount < 64u)
+            static const uint32_t kMaxDtxMissLogs =
+                ps2DiagEnvLimit("PS2X_DTX_MISS_MAX_LOGS", 64u);
+            static std::atomic<bool> s_dtxMissTruncated{false};
+            if (ps2DiagLogBudget(std::cout,
+                                 "[sceSifSetDma:DTX_MISS]",
+                                 "PS2X_DTX_MISS_MAX_LOGS",
+                                 kMaxDtxMissLogs,
+                                 dtxMissLogCount,
+                                 s_dtxMissTruncated))
             {
                 uint32_t knownTransfers = 0u;
                 uint32_t sampleDtxId = 0u;
@@ -1022,7 +1189,15 @@ namespace ps2_syscalls
         }
 
         static uint32_t dtxAckLogCount = 0u;
-        if (dtxAckLogCount < 32u)
+        static const uint32_t kMaxDtxAckLogs =
+            ps2DiagEnvLimit("PS2X_DTX_ACK_MAX_LOGS", 32u);
+        static std::atomic<bool> s_dtxAckTruncated{false};
+        if (ps2DiagLogBudget(std::cout,
+                             "[sceSifSetDma:DTX_ACK]",
+                             "PS2X_DTX_ACK_MAX_LOGS",
+                             kMaxDtxAckLogs,
+                             dtxAckLogCount,
+                             s_dtxAckTruncated))
         {
             RUNTIME_LOG("[sceSifSetDma:DTX_ACK] dtxId=0x" << std::hex << matched.dtxId
                                                           << " ee=0x" << matched.eeWorkAddr
@@ -1061,6 +1236,151 @@ namespace ps2_syscalls
     {
         std::lock_guard<std::mutex> lock(g_rpc_mutex);
         g_soundDriverCompatLayout = {};
+    }
+
+    // Game-parameterized SoundDriver HLE layout (runtime/ps2_sounddriver.h).
+    void setSoundDriverGameLayout(const PS2SoundDriverGameLayout &layout)
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        g_soundDriverGameLayout = layout;
+        std::cout << "[sdrdrv-hle] game layout installed: sid=0x" << std::hex
+                  << layout.serviceSid
+                  << " streamOpenFno=0x" << layout.streamOpenFno
+                  << " streamState=0x" << layout.streamStateAddr
+                  << " chanObj=0x" << layout.channelObjectAddr
+                  << " allocTbl=0x" << layout.channelAllocFlagTableAddr
+                  << " stopFlag=0x" << layout.stopCompletionFlagAddr
+                  << " streamCursor=0x" << std::hex << layout.streamCursorAddr
+                  << " streamBufSize=0x" << layout.streamBufSizeAddr
+                  << " streamByteCount=0x" << layout.streamByteCountAddr
+                  << " streamDmaCmd=0x" << layout.streamDmaCmdIndex
+                  << std::dec << std::endl;
+    }
+
+    // --- 2026-07-20 metering state (recomp2-local addition; GENERIC, keyed
+    // off nothing game-specific -- upstream candidate alongside the function
+    // below). modelSoundDriverStreamDmaCompletion used to slam the consume
+    // cursor straight to bufSize on every single call, so the guest's
+    // "(cursor >= bufSize)" drain-poll observed a full buffer the very first
+    // tick -- a self-inflicted premature EOF (dq8 §3.31/§3.32; the movie
+    // audio-poster fn_1a0b40 saw "drained" after ~2-3 decoded frames instead
+    // of after real playback time). Meter the advance to a per-vsync-tick
+    // byte quota instead, so the cursor only reaches bufSize after the
+    // amount of real time SPU2 would actually take to drain that many bytes.
+    //
+    // Quota derivation: standard PS2 SPU2 stream playback is 48000 Hz
+    // stereo 16-bit PCM = 192000 bytes/sec; at a 60 Hz vsync that is 3200
+    // bytes/tick. The runner's audio-ES demux (MpegFfmpegDecoder.cpp,
+    // demuxPssVideoElementaryStream) currently discards the audio
+    // elementary stream entirely (video-only per the Phase 2 scope), so
+    // there is no per-title PCM rate to read yet -- this constant is the
+    // documented "sane constant tied to vsync ticks" fallback the task
+    // brief allows. A future pass that demuxes the real audio track can
+    // replace this with a derived rate without changing the metering shape.
+    constexpr uint32_t kStreamBytesPerVsyncTick = 3200u;
+
+    namespace
+    {
+        struct StreamDmaMeterState
+        {
+            bool haveLastTick = false;
+            uint64_t lastTick = 0u;
+            // Shadow of the cursor value we last WROTE. Used only to tell a
+            // guest-side mid-session reset (cursor observed back at 0 after we
+            // had advanced it) apart from the ordinary "still at the start of a
+            // fresh window" case -- see the deadlock note on the function below.
+            uint32_t lastWrittenCursor = 0u;
+        };
+        StreamDmaMeterState g_streamDmaMeter;
+    }
+
+    // Model an IOP SPU2 streaming-DMA completion (see ps2_sounddriver.h).
+    // The EE has no producer of the consume cursor once the IOP driver is
+    // HLE'd, so this advances it toward the buffer size at the metered
+    // real-time rate above (clamped, never overshooting) instead of an
+    // instant full drain. Caller-gated on an active streaming session.
+    //
+    // Wrap/refill: the guest itself never resets [streamCursorAddr] mid-
+    // session -- the only writer besides this function is the session
+    // start/stop reset (sub_001A13D0 zeroing the field, dq8 §3.32 trace).
+    // We therefore treat "cursor freshly read back as 0" as the signal that
+    // a new metering window has begun (either the very first call of a
+    // session, or the guest having reset it at teardown/setup) and reset
+    // our elapsed-tick baseline to now WITHOUT advancing on that call --
+    // this is self-correcting and needs no explicit session-identity
+    // tracking: we always read the guest's live cursor value fresh rather
+    // than keeping our own shadow copy.
+    //
+    // 2026-07-20 DEADLOCK FIX: "cursor == 0 -> re-baseline and return" was
+    // unconditional, and since this function is the ONLY producer of the
+    // cursor, the cursor is 0 on entry to *every* call of a fresh session --
+    // so the re-baseline branch was taken forever and the cursor could never
+    // leave 0. The guest's drain-poll ("cursor >= bufSize") therefore never
+    // passed, which in DQ8 parked the whole intro-movie pipeline (see the
+    // report accompanying this change: audio poster fn_1a0b40 never reached
+    // its 0x1a0ddc/0x1a0df0 stores, so the blocking movie-prime loop in
+    // title_fn_00463c50 never exited and nothing consumed the video ring).
+    // Correct discriminant for "the guest reset the cursor" is "we had
+    // previously written a NON-ZERO cursor and now read back 0", which needs
+    // the one-word shadow added to StreamDmaMeterState above. A cursor that
+    // reads 0 because it is genuinely still at the start of the window must
+    // fall through and be advanced.
+    bool modelSoundDriverStreamDmaCompletion(uint8_t *rdram)
+    {
+        std::lock_guard<std::mutex> lock(g_rpc_mutex);
+        const PS2SoundDriverGameLayout &gl = g_soundDriverGameLayout;
+        if (!rdram || gl.streamCursorAddr == 0u || gl.streamBufSizeAddr == 0u)
+            return false;
+        uint32_t bufSize = 0u;
+        if (!readGuestU32(rdram, gl.streamBufSizeAddr, bufSize) || bufSize == 0u)
+            return false;
+
+        uint32_t cursor = 0u;
+        (void)readGuestU32(rdram, gl.streamCursorAddr, cursor);
+
+        const uint64_t nowTick = ps2_syscalls::GetCurrentVSyncTick();
+
+        if (!g_streamDmaMeter.haveLastTick ||
+            (cursor == 0u && g_streamDmaMeter.lastWrittenCursor != 0u))
+        {
+            // Fresh metering window (session start, or a guest-side reset
+            // observed) -- (re)baseline without advancing this call.
+            g_streamDmaMeter.haveLastTick = true;
+            g_streamDmaMeter.lastTick = nowTick;
+            g_streamDmaMeter.lastWrittenCursor = cursor;
+            return false;
+        }
+
+        const uint64_t elapsedTicks =
+            (nowTick >= g_streamDmaMeter.lastTick) ? (nowTick - g_streamDmaMeter.lastTick) : 0u;
+        g_streamDmaMeter.lastTick = nowTick;
+        if (elapsedTicks == 0u)
+        {
+            return false; // no real time passed since the last tick; nothing to meter yet.
+        }
+
+        const uint64_t advance = elapsedTicks * static_cast<uint64_t>(kStreamBytesPerVsyncTick);
+        uint64_t newCursor = static_cast<uint64_t>(cursor) + advance;
+        const bool drained = newCursor >= bufSize;
+        if (drained)
+        {
+            newCursor = bufSize; // clamp; do not overshoot -- see wrap/refill note above.
+        }
+        (void)writeGuestU32(rdram, gl.streamCursorAddr, static_cast<uint32_t>(newCursor));
+        g_streamDmaMeter.lastWrittenCursor = static_cast<uint32_t>(newCursor);
+
+        // Maintain the running consumed-byte count by the SAME metered
+        // increment (not a full bufSize slam every call) so it tracks real
+        // elapsed playback instead of free-running into the billions.
+        if (gl.streamByteCountAddr != 0u)
+        {
+            const uint64_t actualAdvance = static_cast<uint64_t>(newCursor) - static_cast<uint64_t>(cursor);
+            uint32_t bytes = 0u;
+            (void)readGuestU32(rdram, gl.streamByteCountAddr, bytes);
+            (void)writeGuestU32(rdram, gl.streamByteCountAddr,
+                                 bytes + static_cast<uint32_t>(actualAdvance));
+        }
+        return drained;
     }
 
     void setDtxCompatLayout(const PS2DtxCompatLayout &layout)
@@ -1215,6 +1535,7 @@ namespace ps2_syscalls
         client->hdr.mode = mode;
 
         uint32_t serverPtr = 0;
+        bool knownServer = false;
         {
             std::lock_guard<std::mutex> lock(g_rpc_mutex);
             client->hdr.rpc_id = g_rpc_next_id++;
@@ -1222,10 +1543,20 @@ namespace ps2_syscalls
             if (it != g_rpc_servers.end())
             {
                 serverPtr = it->second.sd_ptr;
+                knownServer = true;
             }
             g_rpc_clients[clientPtr] = {};
             g_rpc_clients[clientPtr].sid = rpcId;
         }
+
+        // TEMP DIAG (mc-probe investigation, 2026-07-19): every SifBindRpc,
+        // with whether it resolved to a real registered server or is about
+        // to fall into the "dummy server for unknown SID" path below. Cheap
+        // (bind is not a per-frame call) so left unthrottled.
+        std::cout << "[rpc-diag] SifBindRpc sid=0x" << std::hex << rpcId
+                  << " mode=0x" << mode << std::dec
+                  << (knownServer ? " -> known server" : " -> UNKNOWN sid (dummy server path)")
+                  << std::endl;
 
         if (!serverPtr)
         {
@@ -1377,7 +1708,16 @@ namespace ps2_syscalls
         const bool isDtxLikeRpc = dtxCompat.isConfigured() &&
                                   ((boundSidHint == dtxCompat.rpcSid) || ((rpcNum & 0xFF00u) == 0x0400u));
         static uint32_t dtxAbiLogCount = 0u;
-        if (isDtxLikeRpc && dtxAbiLogCount < 96u)
+        static const uint32_t kMaxDtxAbiLogs =
+            ps2DiagEnvLimit("PS2X_DTX_ABI_MAX_LOGS", 96u);
+        static std::atomic<bool> s_dtxAbiTruncated{false};
+        if (isDtxLikeRpc &&
+            ps2DiagLogBudget(std::cout,
+                             "[SifCallRpc:ABI]",
+                             "PS2X_DTX_ABI_MAX_LOGS",
+                             kMaxDtxAbiLogs,
+                             dtxAbiLogCount,
+                             s_dtxAbiTruncated))
         {
             RUNTIME_LOG("[SifCallRpc:ABI] client=0x" << std::hex << clientPtr
                                                      << " rpc=0x" << rpcNum
@@ -1430,6 +1770,49 @@ namespace ps2_syscalls
             if (it != g_rpc_clients.end())
             {
                 sid = it->second.sid;
+            }
+        }
+
+        // TEMP DIAG (mc-probe investigation, 2026-07-19): every SifCallRpc,
+        // service ID + call number + buffer shape + first two request words
+        // (a "checking memory card" mcserv RPC would show up here with the
+        // service ID DQ8 binds for the memory-card IOP module). Throttled
+        // per (sid,rpcNum) bucket to stay low-noise on any per-frame-polled
+        // service (e.g. sound driver) while still catching rare/one-shot
+        // calls (a card-check probe) in full.
+        {
+            static std::mutex diagMutex;
+            static std::unordered_map<uint64_t, uint32_t> diagCounts;
+            const uint64_t bucketKey = (static_cast<uint64_t>(sid) << 32) | rpcNum;
+            uint32_t bucketN = 0u;
+            {
+                std::lock_guard<std::mutex> lock(diagMutex);
+                bucketN = ++diagCounts[bucketKey];
+            }
+            if (bucketN <= 16u || (bucketN & 0xFFu) == 0u)
+            {
+                uint32_t word0 = 0u;
+                uint32_t word1 = 0u;
+                if (sendBuf && sendSize >= sizeof(uint32_t))
+                {
+                    if (const uint8_t *p = getConstMemPtr(rdram, sendBuf))
+                    {
+                        std::memcpy(&word0, p, sizeof(word0));
+                    }
+                }
+                if (sendBuf && sendSize >= 2u * sizeof(uint32_t))
+                {
+                    if (const uint8_t *p = getConstMemPtr(rdram, sendBuf + 4u))
+                    {
+                        std::memcpy(&word1, p, sizeof(word1));
+                    }
+                }
+                std::cout << "[rpc-diag] SifCallRpc sid=0x" << std::hex << sid
+                          << " fno=0x" << rpcNum << std::dec
+                          << " sendSize=" << sendSize << " recvSize=" << recvSize
+                          << " sendWord0=0x" << std::hex << word0
+                          << " sendWord1=0x" << word1 << std::dec
+                          << " n=" << bucketN << std::endl;
             }
         }
 
@@ -1627,7 +2010,15 @@ namespace ps2_syscalls
                     rpcZeroRdram(rdram, recvBuf + sizeof(uint32_t), recvSize - sizeof(uint32_t));
                 }
                 static uint32_t dtxCreateLogCount = 0;
-                if (dtxCreateLogCount < 64u)
+                static const uint32_t kMaxDtxCreateLogs =
+                    ps2DiagEnvLimit("PS2X_DTX_CREATE_MAX_LOGS", 64u);
+                static std::atomic<bool> s_dtxCreateTruncated{false};
+                if (ps2DiagLogBudget(std::cout,
+                                     "[SifCallRpc:DTX_CREATE]",
+                                     "PS2X_DTX_CREATE_MAX_LOGS",
+                                     kMaxDtxCreateLogs,
+                                     dtxCreateLogCount,
+                                     s_dtxCreateTruncated))
                 {
                     RUNTIME_LOG("[SifCallRpc:DTX_CREATE] dtxId=0x" << std::hex << dtxId
                                                                    << " remote=0x" << remoteHandle
@@ -2100,7 +2491,15 @@ namespace ps2_syscalls
         if (isDtxUrpc)
         {
             static int dtxUrpcLogCount = 0;
-            if (dtxUrpcLogCount < 64)
+            static const uint32_t kMaxDtxUrpcLogs =
+                ps2DiagEnvLimit("PS2X_DTX_URPC_MAX_LOGS", 64u);
+            static std::atomic<bool> s_dtxUrpcTruncated{false};
+            if (ps2DiagLogBudget(std::cout,
+                                 "[SifCallRpc:DTX]",
+                                 "PS2X_DTX_URPC_MAX_LOGS",
+                                 kMaxDtxUrpcLogs,
+                                 static_cast<uint32_t>(dtxUrpcLogCount),
+                                 s_dtxUrpcTruncated))
             {
                 uint32_t dtxUrpcRecv0 = 0;
                 if (recvBuf && recvSize >= sizeof(uint32_t))
@@ -2199,7 +2598,15 @@ namespace ps2_syscalls
                 const bool fallbackSignaledSema = signalRpcCompletionSema(semaId);
 
                 static uint32_t unresolvedEndFuncWarnCount = 0;
-                if (unresolvedEndFuncWarnCount < 32u)
+                static const uint32_t kMaxUnresolvedEndFuncLogs =
+                    ps2DiagEnvLimit("PS2X_RPC_UNRESOLVED_ENDFUNC_MAX_LOGS", 32u);
+                static std::atomic<bool> s_unresolvedEndFuncTruncated{false};
+                if (ps2DiagLogBudget(std::cerr,
+                                     "[SifCallRpc:unresolved-endfunc]",
+                                     "PS2X_RPC_UNRESOLVED_ENDFUNC_MAX_LOGS",
+                                     kMaxUnresolvedEndFuncLogs,
+                                     unresolvedEndFuncWarnCount,
+                                     s_unresolvedEndFuncTruncated))
                 {
                     std::cerr << "[SifCallRpc] unresolved end callback endFunc=0x" << std::hex << endFunc
                               << " semaId=0x" << semaId

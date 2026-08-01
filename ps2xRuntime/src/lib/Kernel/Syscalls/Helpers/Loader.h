@@ -62,7 +62,15 @@ namespace
         }
 
         std::lock_guard<std::mutex> lock(g_sif_module_mutex);
-        if (g_sif_module_log_count >= kMaxSifModuleLogs)
+        static const uint32_t kSifModuleLogLimit =
+            ps2DiagEnvLimit("PS2X_SIF_MODULE_MAX_LOGS", kMaxSifModuleLogs);
+        static std::atomic<bool> s_sifModuleLogTruncated{false};
+        if (!ps2DiagLogBudget(std::cout,
+                              "[SIF module]",
+                              "PS2X_SIF_MODULE_MAX_LOGS",
+                              kSifModuleLogLimit,
+                              g_sif_module_log_count,
+                              s_sifModuleLogTruncated))
         {
             return;
         }
@@ -257,7 +265,16 @@ namespace
         bool loadedAny = false;
         const bool loadAll = sectionName.empty() || toLowerAscii(sectionName) == "all";
         static uint32_t secFilterLogCount = 0;
-        if (!loadAll && secFilterLogCount < 8u)
+        static const uint32_t kMaxSecFilterLogs =
+            ps2DiagEnvLimit("PS2X_ELF_SECFILTER_MAX_LOGS", 8u);
+        static std::atomic<bool> s_secFilterTruncated{false};
+        if (!loadAll &&
+            ps2DiagLogBudget(std::cout,
+                             "[SifLoadElfPart:secfilter]",
+                             "PS2X_ELF_SECFILTER_MAX_LOGS",
+                             kMaxSecFilterLogs,
+                             secFilterLogCount,
+                             s_secFilterTruncated))
         {
             RUNTIME_LOG("[SifLoadElfPart] section filter \"" << sectionName
                       << "\" requested; loading PT_LOAD segments only." << std::endl);
@@ -384,7 +401,15 @@ namespace
         if (!loadElfIntoGuestMemory(hostPath, rdram, runtime, sectionName, execData, loadError))
         {
             static uint32_t logCount = 0;
-            if (logCount < 16u)
+            static const uint32_t kMaxElfLoadFailLogs =
+                ps2DiagEnvLimit("PS2X_ELF_LOADFAIL_MAX_LOGS", 16u);
+            static std::atomic<bool> s_elfLoadFailTruncated{false};
+            if (ps2DiagLogBudget(std::cerr,
+                                 "[SifLoadElfPart:failed]",
+                                 "PS2X_ELF_LOADFAIL_MAX_LOGS",
+                                 kMaxElfLoadFailLogs,
+                                 logCount,
+                                 s_elfLoadFailTruncated))
             {
                 std::cerr << "[SifLoadElfPart] failed path=\"" << ps2Path << "\" host=\"" << hostPath
                           << "\" reason=" << loadError << std::endl;

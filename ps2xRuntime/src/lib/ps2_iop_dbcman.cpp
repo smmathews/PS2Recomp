@@ -1,5 +1,7 @@
 #include "runtime/ps2_iop_dbcman.h"
 #include "runtime/ps2_memory.h"
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 
@@ -7,6 +9,44 @@ namespace
 {
     constexpr uint32_t IOP_SID_DBCMAN = 0x80001300u;
     constexpr uint32_t DBCMAN_RPC_CHECK_VERSION = 0x80001363u;
+
+    // Local twin of ps2DiagEnvLimit/ps2DiagLogBudget (ps2_runtime.h) for TUs
+    // that do not include that header. A capped probe that drops events
+    // silently is worse than no probe: the truncated tail reads as "the event
+    // never happened again". See ps2_runtime.h for the canonical version.
+    uint32_t localDiagEnvLimit(const char *envName, uint32_t fallback)
+    {
+        const char *raw = std::getenv(envName);
+        if (!raw || raw[0] == '\0')
+        {
+            return fallback;
+        }
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(raw, &end, 0);
+        if (end == raw)
+        {
+            return fallback;
+        }
+        return static_cast<uint32_t>(parsed);
+    }
+
+    bool localDiagLogBudget(std::ostream &os, const char *tag, const char *envName,
+                            uint32_t limit, uint32_t logIndex,
+                            std::atomic<bool> &truncationAnnounced)
+    {
+        if (limit == 0u || logIndex < limit)
+        {
+            return true;
+        }
+        bool expected = false;
+        if (truncationAnnounced.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        {
+            os << tag << " TRUNCATED after " << limit
+               << " events; further events are NOT logged (raise or disable with "
+               << envName << "=<n>, 0 = unlimited)" << std::endl;
+        }
+        return false;
+    }
 
     static bool writeIopU32(uint8_t *rdram, uint32_t addr, uint32_t value)
     {
@@ -62,7 +102,14 @@ namespace ps2_iop_dbcman
         default:
         {
             static uint32_t dbcLogCount = 0;
-            if (dbcLogCount < 32)
+            static const uint32_t kMaxDbcLogs = localDiagEnvLimit("PS2X_DBCMAN_STUB_MAX_LOGS", 32u);
+            static std::atomic<bool> s_dbcLogTruncated{false};
+            if (localDiagLogBudget(std::cerr,
+                                   "[DBCMAN:stub]",
+                                   "PS2X_DBCMAN_STUB_MAX_LOGS",
+                                   kMaxDbcLogs,
+                                   dbcLogCount,
+                                   s_dbcLogTruncated))
             {
                 std::cerr << "[DBCMAN:stub]"
                           << " sid=0x" << std::hex << sid

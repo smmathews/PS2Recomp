@@ -133,6 +133,11 @@ namespace ps2sched
     void clear_suspend(int tid);
 
     // Rotate the equal-priority group in the run queue (RotateThreadReadyQueue).
+    // If the CALLER is at `priority` it goes to the tail of its own group and
+    // this call YIELDS (the running fiber is the conceptual head of its ready
+    // queue on real hardware), provided another fiber at that priority or
+    // better is runnable. Must therefore only be called from a fiber context
+    // where yielding is legal (i.e. from the RotateThreadReadyQueue syscall).
     void rotate_ready_queue(int priority);
 
     // -----------------------------------------------------------------------
@@ -156,6 +161,26 @@ namespace ps2sched
     // Sampled every 128 back-edges. Checks terminateRequested, suspendCount,
     // and priority; may ps2fiber_yield internally. Always returns false.
     bool yield_point();
+
+    // Diagnostic: number of host workers currently blocked in async_guest_begin().
+    int host_token_waiters();
+
+    // True iff the calling OS thread is the single guest executor thread (the
+    // thread that runs all guest fibers). Use this to decide whether a shared
+    // dispatch helper (e.g. one invoked BOTH by a host worker via AsyncGuestScope
+    // AND, in some call paths, synchronously from already-running guest code)
+    // needs to borrow the guest token at all: a call already running on the
+    // guest thread already owns the execution slot implicitly and must NOT
+    // attempt async_guest_begin() (it aborts by design -- see async_guest_begin).
+    bool is_guest_thread();
+
+    // Diagnostic: log tid/priority/state/pc/ra for every known fiber (Fresh,
+    // Ready, Running, Blocked, Exiting, Finished), one line per fiber, to
+    // stdout. Safe to call from the host frame-loop thread (takes
+    // g_sched_mutex briefly). Intended as a low-noise, permanent one-shot
+    // diagnostic (e.g. triggered once ~30s into a boot) to answer "where is
+    // each guest thread parked" without needing per-callsite instrumentation.
+    void dump_all_fibers(const char *reasonTag);
 
 } // namespace ps2sched
 

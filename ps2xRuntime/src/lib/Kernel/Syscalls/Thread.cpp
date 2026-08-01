@@ -1017,7 +1017,15 @@ namespace ps2_syscalls
                 prio = (current->currentPriority > 0) ? current->currentPriority : 1;
             }
         }
-        if (logCount < 16)
+        static const uint32_t kMaxRotateLogs =
+            ps2DiagEnvLimit("PS2X_ROTATE_READYQ_MAX_LOGS", 16u);
+        static std::atomic<bool> s_rotateLogTruncated{false};
+        if (ps2DiagLogBudget(std::cout,
+                             "[RotateThreadReadyQueue]",
+                             "PS2X_ROTATE_READYQ_MAX_LOGS",
+                             kMaxRotateLogs,
+                             static_cast<uint32_t>(logCount),
+                             s_rotateLogTruncated))
         {
             RUNTIME_LOG("[RotateThreadReadyQueue] prio=" << prio);
             ++logCount;
