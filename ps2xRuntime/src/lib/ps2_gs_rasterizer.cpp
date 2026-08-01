@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -266,6 +267,79 @@ namespace
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
         return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+    }
+
+    // SPEC 03 (dq8/reference/dc2-learnings/03-nearplane-clip-homogeneous.md)
+    // kill switch: PS2X_NEARPLANE_CLIP=0 disables near-plane/guard-band
+    // triangle rejection. ON by DEFAULT (unset, empty, or any value other
+    // than exactly "0"), per the spec's "test the VALUE not mere presence"
+    // instruction -- do not regress to a getenv()!=nullptr presence check.
+    bool nearplaneClipDisabled()
+    {
+        static const bool s_disabled = []() {
+            const char *e = std::getenv("PS2X_NEARPLANE_CLIP");
+            return e != nullptr && std::strcmp(e, "0") == 0;
+        }();
+        return s_disabled;
+    }
+
+    // GSVertex.x/y/z reach the rasterizer already perspective-divided by the
+    // upstream VU transform (real GS hardware has no vertex-position clip
+    // pipeline of its own -- XYZ2/XYZ3 GIF registers are final screen-space
+    // coordinates). GSVertex.q is the reciprocal-W that rode along with the
+    // vertex purely for ST perspective-correct texture interpolation, but it
+    // doubles as the only signal this rasterizer has for "how close to (or
+    // behind) the camera was this vertex before the divide."
+    //
+    // DC2 (G101/G125/G126/G128, same Level-5 engine) found that once a
+    // vertex is behind or extremely near the camera, its already-divided
+    // screen X/Y has typically already been FTOI4-quantized/saturated by
+    // the time it reaches the rasterizer -- so reconstructing clip-space
+    // (clip = screen * W) and intersecting the near plane from that data
+    // intersects from garbage endpoints (G128). Their final, shipped,
+    // robust choice was NOT to attempt a precise per-edge clip: drop the
+    // whole triangle when any vertex's q is at/behind the near-plane
+    // threshold, rather than clip from corrupt data.
+    //
+    // We follow that same robust-over-precise choice. Note we only apply
+    // G126's LOWER bound (q > qmin); the UPPER bound in DC2's checklist
+    // (q <= 1/wNear) needs the camera's near-plane W, which is a VU/camera
+    // constant this GS-level rasterizer has no visibility into -- omitted
+    // deliberately rather than guessed.
+    constexpr float kNearPlaneQMin = 1.0e-6f;
+
+    // Real GS hardware has an implicit guard band: primitives far outside
+    // the scissor are clipped/culled before they ever reach the pixel
+    // pipeline. This software rasterizer has no such stage, so a triangle
+    // with a vertex projected wildly off-screen (near-plane singularity,
+    // missing strip-restart, or any other upstream corruption) paints a
+    // full-width streak instead of vanishing the way HW would. DC2 (G89)
+    // used a tunable margin outside the scissor, default 512px; we mirror
+    // that default.
+    constexpr float kGuardBandMarginPx = 512.0f;
+
+    bool triangleNeedsNearOrGuardBandCull(float fx0, float fy0, float fx1, float fy1,
+                                          float fx2, float fy2, float q0, float q1, float q2,
+                                          const GSScissorReg &scissor)
+    {
+        // Near-plane: any vertex at/behind the camera -> drop (G101/G128).
+        if (q0 <= kNearPlaneQMin || q1 <= kNearPlaneQMin || q2 <= kNearPlaneQMin)
+            return true;
+
+        // Guard-band: any vertex far outside the scissor -> drop (G89).
+        const float loX = static_cast<float>(scissor.x0) - kGuardBandMarginPx;
+        const float hiX = static_cast<float>(scissor.x1) + kGuardBandMarginPx;
+        const float loY = static_cast<float>(scissor.y0) - kGuardBandMarginPx;
+        const float hiY = static_cast<float>(scissor.y1) + kGuardBandMarginPx;
+
+        if (fx0 < loX || fx0 > hiX || fy0 < loY || fy0 > hiY)
+            return true;
+        if (fx1 < loX || fx1 > hiX || fy1 < loY || fy1 > hiY)
+            return true;
+        if (fx2 < loX || fx2 > hiX || fy2 < loY || fy2 > hiY)
+            return true;
+
+        return false;
     }
 }
 
@@ -940,6 +1014,12 @@ void GSRasterizer::drawTriangle(GS *gs)
     float fy1 = v1.y - static_cast<float>(ofy);
     float fx2 = v2.x - static_cast<float>(ofx);
     float fy2 = v2.y - static_cast<float>(ofy);
+
+    if (!nearplaneClipDisabled() &&
+        triangleNeedsNearOrGuardBandCull(fx0, fy0, fx1, fy1, fx2, fy2, v0.q, v1.q, v2.q, ctx.scissor))
+    {
+        return;
+    }
 
     int minX = static_cast<int>(std::floor(std::min({fx0, fx1, fx2})));
     int maxX = static_cast<int>(std::ceil(std::max({fx0, fx1, fx2})));

@@ -76,7 +76,20 @@ namespace ps2recomp
             case COP1_S_CVT_W:
                 return fmt::format("{{ int32_t tmp = FPU_CVT_W_S(ctx->f[{}]); std::memcpy(&ctx->f[{}], &tmp, sizeof(tmp)); }}", fs, fd);
             case COP1_S_RSQRT:
-                return fmt::format("ctx->f[{}] = 1.0f / sqrtf(ctx->f[{}]);", fd, fs);
+                // rsqrt.s fd, fs, ft  ->  fd = fs / sqrt(|ft|). It is a
+                // two-operand instruction: the old emission used fs as the
+                // radicand, hard-coded 1.0 as the numerator and ignored ft
+                // entirely, so the canonical "rsqrt.s fd, one, len2" idiom
+                // returned 1/sqrt(1.0) = 1.0 for every input. It also handed
+                // back Inf for ft == 0 and a NaN for ft < 0, neither of which
+                // this FPU can represent. PCSX2 FPU.cpp RSQRT_S: a zero ft
+                // sets D and yields ((fs ^ ft) & sign) | posFmax; a negative
+                // ft sets I and uses sqrt(fabs(ft)).
+                return fmt::format("if ((ctx->f[{}] == 0.0f)) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "uint32_t _rn, _rd; std::memcpy(&_rn, &ctx->f[{}], 4); std::memcpy(&_rd, &ctx->f[{}], 4); "
+                                   "uint32_t _rr = ((_rn ^ _rd) & 0x80000000u) | 0x7F7FFFFFu; std::memcpy(&ctx->f[{}], &_rr, 4); }} "
+                                   "else ctx->f[{}] = FPU_DIV_S(ctx->f[{}], FPU_SQRT_S(ctx->f[{}]));",
+                                   ft, fs, ft, fd, fd, fs, ft);
             case COP1_S_ADDA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_ADD_S(ctx->f[{}], ctx->f[{}]));", fs, ft);
             case COP1_S_SUBA:

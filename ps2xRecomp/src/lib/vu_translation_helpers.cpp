@@ -87,9 +87,20 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
     {
+        uint8_t fsf = inst.vectorInfo.fsf;
         uint8_t ftf = inst.vectorInfo.ftf;
+        uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
+        // VRSQRT Q, vfs[fsf], vft[ftf]  ->  Q = fs / sqrt(|ft|). The numerator
+        // is a real operand: the old emission hard-coded 1.0 and dropped fs
+        // entirely. A zero radicand latches +/-Fmax (sign fs^ft) with D set,
+        // and a negative one uses |ft| with I set -- PCSX2 VUops.cpp _vuRSQRT.
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+                           "float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); "
+                           "if (ft == 0.0f) {{ uint32_t _rn, _rd; std::memcpy(&_rn, &fs, 4); std::memcpy(&_rd, &ft, 4); "
+                           "uint32_t _rr = ((_rn ^ _rd) & 0x80000000u) | 0x7F7FFFFFu; std::memcpy(&ctx->vu0_q, &_rr, 4); }} "
+                           "else ctx->vu0_q = FPU_DIV_S(fs, PS2_VSQRT(ft)); }}",
+                           fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)

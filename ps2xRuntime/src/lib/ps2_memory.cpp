@@ -1453,6 +1453,198 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     processPendingTransfers();
                 }
             }
+            else if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                // D8 (toSPR, 0x1000D000u): main RAM (MADR) -> scratchpad (SADR)
+                // D9 (fromSPR, 0x1000D400u): scratchpad (SADR) -> main RAM (MADR)
+                //
+                // Level-5's "mg" library (DQ8) stages every VU1 geometry packet
+                // in scratchpad and moves it with this ping-pong (see
+                // sub_00111A28: D9_SADR=0, D9_MADR=$s2, D9_QWC=$s4,
+                // D9_CHCR=STR|DIR=0x101; D8_SADR=0, D8_MADR=$s1). These two
+                // channels were previously unimplemented: the CHCR write fell
+                // through to no-op here. The STR force-clear on CHCR read
+                // (top of read32's 0x10008000-0x1000EFFF handling) still
+                // applies to D8/D9, so the guest's completion poll succeeds
+                // once we actually perform the copy below.
+                const bool fromSpr = (channelBase == 0x1000D400u);
+                uint32_t chcr = value;
+                uint32_t mode = (chcr >> 2) & 0x3u;
+                uint32_t sadr = m_ioRegisters[channelBase + 0x80] & (PS2_SCRATCHPAD_SIZE - 1u);
+
+                // Copies one quadword between scratchpad[sadr] and RAM[ramAddr]
+                // (direction fixed by the channel), then advances/wraps SADR
+                // within the scratchpad.
+                auto copyQuadword = [&](uint32_t ramAddr)
+                {
+                    uint32_t ramPhys = 0u;
+                    try
+                    {
+                        ramPhys = translateAddress(ramAddr);
+                    }
+                    catch (...)
+                    {
+                        return;
+                    }
+                    if (ramPhys + 16u > PS2_RAM_SIZE)
+                        return;
+                    if (fromSpr)
+                        std::memcpy(m_rdram + ramPhys, m_scratchpad + sadr, 16);
+                    else
+                        std::memcpy(m_scratchpad + sadr, m_rdram + ramPhys, 16);
+                    sadr = (sadr + 16u) & (PS2_SCRATCHPAD_SIZE - 1u);
+                };
+
+                auto copyRun = [&](uint32_t ramAddr, uint32_t qwCount)
+                {
+                    for (uint32_t i = 0; i < qwCount; ++i)
+                    {
+                        copyQuadword(ramAddr);
+                        ramAddr += 16u;
+                    }
+                };
+
+                if (mode == 0 && qwc > 0)
+                {
+                    // Normal mode: a straight run of QWC quadwords starting at
+                    // MADR -- the DQ8 fromSPR/toSPR ping-pong path.
+                    copyRun(madr, qwc);
+                }
+                else if (mode == 1)
+                {
+                    // Chain mode: identical DMAtag walk/ID semantics to the
+                    // VIF1/GIF chain handling above (TADR is the tag-chain
+                    // pointer, same tag-id switch), except the payload is
+                    // copied directly to/from the scratchpad instead of being
+                    // queued for a VIF/GIF consumer.
+                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
+                    uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                    uint32_t asp = (chcr >> 4) & 0x3u;
+                    const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+                    const int kMaxChainTags = 65536;
+                    int tagsProcessed = 0;
+
+                    while (tagsProcessed < kMaxChainTags)
+                    {
+                        const bool tagInSPR = isScratchpad(tagAddr);
+                        uint32_t physTag = 0;
+                        try
+                        {
+                            physTag = translateAddress(tagAddr);
+                        }
+                        catch (...)
+                        {
+                            break;
+                        }
+                        const uint8_t *tagBase;
+                        uint32_t tagMax;
+                        if (tagInSPR)
+                        {
+                            tagBase = m_scratchpad;
+                            tagMax = PS2_SCRATCHPAD_SIZE;
+                        }
+                        else
+                        {
+                            tagBase = m_rdram;
+                            tagMax = PS2_RAM_SIZE;
+                        }
+                        if (physTag + 16u > tagMax)
+                            break;
+
+                        const uint8_t *tp = tagBase + physTag;
+                        uint64_t tag = loadScalar<uint64_t>(tp, 0, 16, "spr dma chain tag", tagAddr);
+                        uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
+                        uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
+                        const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
+                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        ++tagsProcessed;
+
+                        uint32_t dataAddr = 0;
+                        bool hasPayload = (tagQwc > 0);
+                        bool endChain = false;
+
+                        switch (id)
+                        {
+                        case 0:
+                            dataAddr = addr;
+                            tagAddr = tagAddr + 16;
+                            endChain = true;
+                            break;
+                        case 1:
+                            dataAddr = tagAddr + 16;
+                            tagAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
+                            break;
+                        case 2:
+                            dataAddr = tagAddr + 16;
+                            tagAddr = addr;
+                            break;
+                        case 3:
+                        case 4:
+                            dataAddr = addr;
+                            tagAddr = tagAddr + 16;
+                            break;
+                        case 5:
+                            dataAddr = tagAddr + 16;
+                            {
+                                const uint32_t retAddr = dataAddr + static_cast<uint32_t>(tagQwc) * 16u;
+                                if (asp == 0u)
+                                {
+                                    asr0 = retAddr;
+                                    asp = 1u;
+                                }
+                                else if (asp == 1u)
+                                {
+                                    asr1 = retAddr;
+                                    asp = 2u;
+                                }
+                            }
+                            tagAddr = addr;
+                            break;
+                        case 6:
+                            dataAddr = tagAddr + 16;
+                            if (asp == 2u)
+                            {
+                                tagAddr = asr1;
+                                asp = 1u;
+                            }
+                            else if (asp == 1u)
+                            {
+                                tagAddr = asr0;
+                                asp = 0u;
+                            }
+                            else
+                            {
+                                endChain = true;
+                            }
+                            break;
+                        case 7:
+                            dataAddr = tagAddr + 16;
+                            endChain = true;
+                            break;
+                        default:
+                            hasPayload = false;
+                            endChain = true;
+                            break;
+                        }
+
+                        if (hasPayload)
+                            copyRun(dataAddr, tagQwc);
+                        if (irq && tieEnabled)
+                            endChain = true;
+                        if (endChain)
+                            break;
+                    }
+
+                    m_ioRegisters[channelBase + 0x30] = tagAddr;
+                    m_ioRegisters[channelBase + 0x40] = asr0;
+                    m_ioRegisters[channelBase + 0x50] = asr1;
+                    chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
+                    m_ioRegisters[channelBase + 0x00] = chcr;
+                }
+
+                m_ioRegisters[channelBase + 0x80] = sadr;
+            }
         }
         return true;
     }
